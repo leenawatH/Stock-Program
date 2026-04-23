@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(node -e 'console.log\\(encodeURIComponent\\(\"https://query1.finance.yahoo.com/v8/finance/chart/NVDA?range=6mo&interval=1d\"\\)\\)')",
+      "Bash(curl -s -o /tmp/yahoo.json -w \"HTTP:%{http_code}\\\\n\" \"https://api.allorigins.win/get?url=$\\(node -e 'console.log\\(encodeURIComponent\\(\"https://query1.finance.yahoo.com/v8/finance/chart/NVDA?range=6mo&interval=1d\"\\)\\)'\\)\")",
+      "Bash(curl -s -o /tmp/yh2.json -w \"HTTP:%{http_code}\\\\n\" \"https://query1.finance.yahoo.com/v8/finance/chart/NVDA?range=6mo&interval=1d\")",
+      "Read(//tmp/**)",
+      "Bash(curl -s -o /tmp/yh3.json -w \"HTTP:%{http_code}\\\\n\" -H \"User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36\" \"https://query1.finance.yahoo.com/v8/finance/chart/NVDA?range=6mo&interval=1d\")",
+      "Bash(curl -s -o /tmp/yahoo_proxy.json -w \"HTTP:%{http_code}\\\\n\" \"http://localhost:5173/api/yahoo/v8/finance/chart/NVDA?range=6mo&interval=1d\")",
+      "Bash(curl -s -o /tmp/doge.json -w \"HTTP:%{http_code}\\\\n\" \"http://localhost:5173/api/yahoo/v8/finance/chart/DOGE-USD?range=6mo&interval=1d\")",
+      "Bash(curl -s -w \"\\\\nHTTP:%{http_code}\\\\n\" \"http://localhost:5173/api/fx/latest?from=USD&to=THB\")",
+      "Bash(curl -sL -w \"\\\\nHTTP:%{http_code}\\\\n\" \"http://localhost:5173/api/fx/latest?from=USD&to=THB\")",
+      "Bash(curl -sI \"http://localhost:5173/api/fx/latest?from=USD&to=THB\")",
+      "Bash(curl -sI -H \"Origin: http://localhost:5173\" \"https://api.frankfurter.dev/v1/latest?from=USD&to=THB\")",
+      "Bash(curl -sI -H \"Origin: http://localhost:5173\" \"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=thb\")",
+      "Bash(curl -s \"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,dogecoin&vs_currencies=thb,usd\")",
+      "Bash(curl -s \"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=thb&days=180\")",
+      "Bash(node -e \"let d=''; process.stdin.on\\('data',c=>d+=c\\); process.stdin.on\\('end',\\(\\)=>{const j=JSON.parse\\(d\\); console.log\\('points:', j.prices?.length, 'first:', j.prices?.[0], 'last:', j.prices?.[j.prices.length-1]\\);}\\)\")",
+      "Bash(curl -s \"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,dogecoin&vs_currencies=thb&include_24hr_change=true\")"
+    ]
+  }
+}
