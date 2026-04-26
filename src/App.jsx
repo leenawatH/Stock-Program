@@ -37,7 +37,7 @@ async function deleteApiKey() {
   try { await window.storage.delete("finnhub_api_key"); } catch {}
 }
 
-// Positions: { [ticker]: { entries: [{id, qty, price, date, note}] } }
+// Positions: { [ticker]: { entries: [{id, qty, price, date}] } }
 async function loadPositions() {
   try {
     const r = await window.storage.get("positions");
@@ -104,7 +104,7 @@ async function fetchYahoo(symbol, range = "6mo", interval = "1d") {
   } catch (e) { return null; }
 }
 
-// CoinGecko: real crypto prices directly in THB (matches Thai exchange prices, no FX conversion)
+// CoinGecko: realtime crypto price (better than Finnhub free tier)
 const COINGECKO_IDS = {
   "BTC-USD": "bitcoin",
   "DOGE-USD": "dogecoin",
@@ -139,59 +139,32 @@ async function fetchCoinGecko(ticker) {
   } catch { return null; }
 }
 
-// USD → THB rate (Frankfurter, ECB data, no key — direct call, CORS allowed)
-async function fetchUsdThbRate() {
-  try {
-    const res = await fetch("https://api.frankfurter.dev/v1/latest?from=USD&to=THB");
-    const d = await res.json();
-    const r = d?.rates?.THB;
-    return typeof r === "number" && r > 0 ? r : null;
-  } catch { return null; }
-}
-
-function convertAssetToTHB(d, rate) {
-  if (!d || !rate) return d;
-  return {
-    ...d,
-    current: d.current * rate,
-    previousClose: d.previousClose * rate,
-    prices: d.prices.map((p) => p * rate),
-    points: d.points.map((pt) => ({ ...pt, price: pt.price * rate })),
-    _thb: true,
-  };
-}
-
 // ========================================================
 // CURRENCY HELPERS
 // ========================================================
-function currencyOf(_ticker) {
-  return "$";
-}
+function currencyOf(_ticker) { return "$"; }
 function fmtPrice(value, ticker, digitsOverride) {
   const sym = currencyOf(ticker);
   if (value == null || Number.isNaN(value)) return `${sym}0.00`;
   const abs = Math.abs(value);
-  // Small prices (DOGE) need more decimals; large baht prices use comma
   const d = digitsOverride != null ? digitsOverride
          : abs < 1 ? 4
-         : abs < 10 ? 2
          : 2;
   return sym + value.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
-// Hybrid fetcher: CoinGecko for crypto (real THB price), Finnhub for stocks/SPY, Yahoo fallback
+// Hybrid fetcher: CoinGecko for crypto, Finnhub for stocks/SPY, Yahoo fallback
 async function fetchAsset(symbol, apiKey) {
   const meta = STOCKS[symbol] || COMPARE_ASSETS[symbol] || {};
 
-  // Crypto: CoinGecko first (returns actual market THB price, no FX needed)
+  // Crypto: CoinGecko first (realtime + reliable on free tier)
   if (meta.kind === "crypto") {
     const cg = await fetchCoinGecko(symbol);
     if (cg) return cg;
-    // Fallback: Finnhub binance (USD) → caller converts with FX
+    // Fallback: Finnhub binance
   }
 
   const useFinnhub = meta.finnhub !== null && (meta.kind === "stock" || meta.kind === "crypto" || symbol === "SPY");
-
   if (useFinnhub) {
     const finnhubSym = meta.finnhub || symbol;
     const candles = await fetchFinnhubCandles(finnhubSym, apiKey);
@@ -206,7 +179,7 @@ async function fetchAsset(symbol, apiKey) {
       return candles;
     }
   }
-  // Fallback / default: Yahoo (handles Gold, DXY, and acts as crypto/stock backup)
+  // Default fallback: Yahoo (handles Gold, DXY)
   return await fetchYahoo(symbol);
 }
 
@@ -388,8 +361,8 @@ function calculateQuantScore(ticker, allData, regime) {
   }
 
   // 3. Regime alignment - 15 points
-  const info = STOCKS[ticker] || {};
-  const riskOn = ["NVDA", "GOOGL"].includes(ticker) || info.kind === "crypto";
+  const tInfo = STOCKS[ticker] || {};
+  const riskOn = ["NVDA", "GOOGL"].includes(ticker) || tInfo.kind === "crypto";
   const riskNeutral = ticker === "BAC";
   if (riskOn && regime.score > 60) { score += 12; signals.push({ name: "Regime", value: regime.regime, sig: "Favors this stock", type: "bull" }); }
   else if (riskOn && regime.score < 40) { score -= 12; signals.push({ name: "Regime", value: regime.regime, sig: "Against this stock", type: "bear" }); }
@@ -945,7 +918,7 @@ function SignalBreakdown({ quant }) {
 }
 
 // ========================================================
-// EXIT PLAN (เมื่อไหร่ควรขาย)
+// EXIT PLAN (เมื่อไหร่ควรขาย) + POSITION TRACKER
 // ========================================================
 function summarizePosition(position, currentPrice) {
   const entries = position?.entries || [];
@@ -957,7 +930,6 @@ function summarizePosition(position, currentPrice) {
   const currentValue = totalQty * currentPrice;
   const pnl = currentValue - totalCost;
   const gainPct = (pnl / totalCost) * 100;
-  // days held: use earliest entry
   const dates = entries.map((e) => e.date).filter(Boolean).sort();
   const daysHeld = dates.length
     ? Math.max(0, Math.round((Date.now() - new Date(dates[0]).getTime()) / 86400000))
@@ -973,7 +945,7 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
   const recent = prices.slice(-20);
   const M = mean(recent);
   const S = std(recent);
-  const v = std(rollingReturns(prices, 20)); // daily vol as fraction
+  const v = std(rollingReturns(prices, 20));
   const high20 = Math.max(...recent);
   const low20 = Math.min(...recent);
 
@@ -981,19 +953,13 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
   const info = STOCKS[ticker] || {};
   const isCrypto = info.kind === "crypto";
 
-  // Take-profit levels
-  // If currently below mean → target mean reversion; if above → target upper band
   const tp1 = z < 0 ? M : M + S;
   const tp2 = z < 0 ? M + S : Math.max(M + 2 * S, P * 1.08);
 
-  // Stop-loss: ATR-style (daily-vol based), crypto wider
   const slPct = isCrypto ? Math.max(0.08, 2.5 * v) : Math.max(0.04, 2 * v);
   const sl = P * (1 - slPct);
-
-  // Trailing-stop suggestion: recent swing low
   const trail = Math.max(low20, P * (1 - slPct * 1.2));
 
-  // Sell triggers
   const triggers = [];
   if (z > 2) triggers.push({ sev: "high", text: `Z-Score ${z.toFixed(2)} — overbought ขั้นรุนแรง mean-reversion สูง` });
   else if (z > 1) triggers.push({ sev: "medium", text: `Z-Score ${z.toFixed(2)} — overbought` });
@@ -1026,36 +992,31 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
     });
   }
 
-  // Near TP
   const pctToTp1 = ((tp1 - P) / P) * 100;
   if (pctToTp1 > -1 && pctToTp1 < 1.5) {
     triggers.push({ sev: "medium", text: `ราคาใกล้ TP1 แล้ว (${pctToTp1.toFixed(1)}%)` });
   }
 
-  // Urgency — context-aware: strong quant trend raises the bar for "sell"
+  // Urgency — context-aware
   const hi = triggers.filter((t) => t.sev === "high").length;
   const md = triggers.filter((t) => t.sev === "medium").length;
   const qScore = quant.score || 50;
-  const trendStrong = qScore >= 75;   // Strong Buy
-  const trendGood = qScore >= 60;     // Buy
+  const trendStrong = qScore >= 75;
+  const trendGood = qScore >= 60;
 
   let urgency, action, color, note;
   if (hi >= 2) {
     urgency = "critical"; action = "🔴 ขายทันที"; color = "#ef4444";
   } else if (hi >= 1) {
     if (trendStrong) {
-      urgency = "watch";
-      action = "🟡 ทยอยขาย 25-33% · ถือที่เหลือด้วย trailing stop";
-      color = "#eab308";
+      urgency = "watch"; action = "🟡 ทยอยขาย 25-33% · ถือที่เหลือด้วย trailing stop"; color = "#eab308";
       note = "Quant ยัง Strong Buy แต่มีสัญญาณเสี่ยง 1 ตัว — lock profit บางส่วน";
     } else {
       urgency = "high"; action = "🟠 ขายบางส่วน / ขยับ SL ขึ้น"; color = "#f97316";
     }
   } else if (md >= 2) {
     if (trendGood) {
-      urgency = "watch";
-      action = "🟢 ถือต่อ + trailing stop (levels ตึง แต่ trend ดี)";
-      color = "#4ade80";
+      urgency = "watch"; action = "🟢 ถือต่อ + trailing stop (levels ตึง แต่ trend ดี)"; color = "#4ade80";
       note = "Quant Buy — medium triggers มาจาก overbought/near-TP1 เป็นเรื่องปกติของ uptrend แกร่ง ไม่ต้องรีบออก";
     } else {
       urgency = "medium"; action = "🟡 เตรียมขาย / trail stop"; color = "#eab308";
@@ -1066,12 +1027,12 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
     urgency = "low"; action = "🟢 ยังถือได้"; color = "#4ade80";
   }
 
-  // ---------- Position-aware Profit Plan ----------
+  // Position-aware Profit Plan
   const pos = summarizePosition(position, P);
   let profitPlan = null;
   if (pos) {
     const g = pos.gainPct;
-    let stage, stageAction, suggestedSL, takeHalfPrice;
+    let stage, stageAction, suggestedSL;
     if (g < -5) {
       stage = "ขาดทุน > 5%";
       stageAction = "ทบทวน thesis: ถ้า SL เดิมโดนชน → ตัดขาดทุน · อย่า average-down ถ้าไม่มี signal ใหม่";
@@ -1092,21 +1053,17 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
       stage = "กำไร 25-50% ดี";
       stageAction = `ทยอยขาย 1/3 ที่ TP1 (${fmtPrice(tp1, ticker)}) · SL ที่ +10% จาก entry`;
       suggestedSL = Math.max(sl, pos.avgCost * 1.1);
-      takeHalfPrice = tp1;
     } else if (g < 100) {
       stage = "กำไร 50-100% เยี่ยม";
       stageAction = "ขาย 1/2 ตอนนี้ lock กำไร · ที่เหลือ trailing tight (5-8%)";
       suggestedSL = Math.max(sl, P * 0.92);
-      takeHalfPrice = P;
     } else {
       stage = `กำไร ${g.toFixed(0)}% · runner`;
       stageAction = "ขาย 2/3 · ที่เหลือเป็น runner ด้วย trailing 10%";
       suggestedSL = Math.max(sl, P * 0.9);
-      takeHalfPrice = P;
     }
-    profitPlan = { stage, stageAction, suggestedSL, takeHalfPrice, gainPct: g };
+    profitPlan = { stage, stageAction, suggestedSL, gainPct: g };
 
-    // Position-aware urgency override
     if (g >= 30 && (hi + md) >= 1 && urgency === "low") {
       urgency = "watch"; action = "🟡 กำไรดี + มีสัญญาณเสี่ยง → take partial profit"; color = "#eab308";
     }
@@ -1248,10 +1205,8 @@ function ExitPlan({ plan, ticker, onAddEntry, onRemoveEntry }) {
         </div>
       )}
 
-      {/* Add entry form */}
       <PositionForm ticker={ticker} onAdd={(e) => onAddEntry(ticker, e)} />
 
-      {/* Entries list */}
       {plan.position && plan.position.entries.length > 0 && (
         <div style={{ marginBottom: 10 }}>
           <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, padding: "4px 0 4px" }}>
@@ -1283,7 +1238,6 @@ function ExitPlan({ plan, ticker, onAddEntry, onRemoveEntry }) {
         </div>
       )}
 
-      {/* Profit plan (position-aware) */}
       {plan.profitPlan && (
         <div style={{
           padding: "10px 12px", borderRadius: 12,
@@ -1319,13 +1273,11 @@ function ExitPlan({ plan, ticker, onAddEntry, onRemoveEntry }) {
         )}
       </div>
 
-      {/* Price levels */}
       {row("Take-Profit 1", fmtPrice(plan.tp1, ticker), `${pct(plan.tp1) >= 0 ? "+" : ""}${pct(plan.tp1)}% จากราคาปัจจุบัน · mean reversion`, pct(plan.tp1) >= 0 ? "gain" : "loss")}
       {row("Take-Profit 2", fmtPrice(plan.tp2, ticker), `${pct(plan.tp2) >= 0 ? "+" : ""}${pct(plan.tp2)}% · stretch target`, pct(plan.tp2) >= 0 ? "gain" : "loss")}
       {row("Stop-Loss", fmtPrice(plan.sl, ticker), `-${plan.slPct.toFixed(1)}% · ${plan.slPct > 8 ? "กว้าง (crypto vol)" : "ตาม 2× daily vol"}`, "loss")}
       {row("Trailing Stop", fmtPrice(plan.trail, ticker), `swing-low 20 วัน / vol-adjusted`, "loss")}
 
-      {/* Triggers */}
       <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, padding: "14px 0 6px" }}>
         ⚠️ SELL TRIGGERS ({plan.triggers.length})
       </div>
@@ -1372,37 +1324,36 @@ export default function StockQuantL3() {
   const [tab, setTab] = useState("signals");
   const [positions, setPositions] = useState({});
 
-  // Load positions on mount
-  useEffect(() => { loadPositions().then(setPositions); }, []);
-
-  function addEntry(ticker, entry) {
-    setPositions((prev) => {
-      const cur = prev[ticker] || { entries: [] };
-      const next = { ...prev, [ticker]: { ...cur, entries: [...cur.entries, entry] } };
-      savePositions(next);
-      return next;
-    });
-  }
-  function removeEntry(ticker, id) {
-    setPositions((prev) => {
-      const cur = prev[ticker];
-      if (!cur) return prev;
-      const next = {
-        ...prev,
-        [ticker]: { ...cur, entries: cur.entries.filter((e) => e.id !== id) },
-      };
-      savePositions(next);
-      return next;
-    });
-  }
-
   // Load API key on mount
   useEffect(() => {
     loadApiKey().then(k => {
       setApiKey(k);
       setKeyLoaded(true);
     });
+    loadPositions().then(setPositions);
   }, []);
+
+  function addEntry(ticker, entry) {
+    setPositions(prev => {
+      const next = { ...prev };
+      const list = Array.isArray(next[ticker]) ? [...next[ticker]] : [];
+      list.push({ id: Date.now() + Math.random(), ...entry });
+      next[ticker] = list;
+      savePositions(next);
+      return next;
+    });
+  }
+
+  function removeEntry(ticker, id) {
+    setPositions(prev => {
+      const next = { ...prev };
+      const list = Array.isArray(next[ticker]) ? next[ticker].filter(e => e.id !== id) : [];
+      if (list.length) next[ticker] = list;
+      else delete next[ticker];
+      savePositions(next);
+      return next;
+    });
+  }
 
   // Fetch data when key ready
   useEffect(() => {
@@ -1683,10 +1634,10 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         {/* Tab Content */}
         <div style={{ padding: "12px 20px 0" }}>
           {tab === "signals" && mainQuant && <SignalBreakdown quant={mainQuant} />}
-          {tab === "exit" && (
+          {tab === "exit" && mainQuant && mainData && (
             <ExitPlan
               ticker={activeStock}
-              plan={calculateExitPlan(activeStock, allData[activeStock], mainQuant, regime, positions[activeStock])}
+              plan={calculateExitPlan(activeStock, mainData, mainQuant, regime, positions[activeStock])}
               onAddEntry={addEntry}
               onRemoveEntry={removeEntry}
             />
