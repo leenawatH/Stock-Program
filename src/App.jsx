@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine, BarChart, Bar, Cell } from "recharts";
 
 // ========================================================
@@ -47,6 +47,71 @@ async function loadPositions() {
 }
 async function savePositions(obj) {
   try { await window.storage.set("positions", JSON.stringify(obj)); } catch {}
+}
+
+// ========================================================
+// ALERT SETTINGS + NOTIFICATIONS
+// ========================================================
+const DEFAULT_ALERTS = {
+  enabled: true,
+  refreshMin: 5,        // auto-refresh interval
+  notifyExtreme: true,  // verdict transitions to Strong Buy/Sell
+  notifyZ: true,        // |z| crosses 2
+  sound: true,
+};
+
+async function loadAlertSettings() {
+  try {
+    const r = await window.storage.get("alerts_v1");
+    if (!r?.value) return DEFAULT_ALERTS;
+    return { ...DEFAULT_ALERTS, ...JSON.parse(r.value) };
+  } catch { return DEFAULT_ALERTS; }
+}
+async function saveAlertSettings(obj) {
+  try { await window.storage.set("alerts_v1", JSON.stringify(obj)); } catch {}
+}
+
+function canNotify() {
+  return typeof window !== "undefined"
+    && "Notification" in window;
+}
+async function requestNotifyPermission() {
+  if (!canNotify()) return "unsupported";
+  if (Notification.permission === "granted") return "granted";
+  if (Notification.permission === "denied") return "denied";
+  try { return await Notification.requestPermission(); }
+  catch { return "denied"; }
+}
+function fireBrowserNotification(title, body) {
+  if (!canNotify() || Notification.permission !== "granted") return;
+  try {
+    new Notification(title, { body, icon: "/vite.svg", badge: "/vite.svg", tag: "quant-l3" });
+  } catch {}
+}
+
+// Web Audio beep (no asset needed) — different tones for buy/sell
+function beep(kind = "buy") {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = "sine";
+    if (kind === "buy") {
+      osc.frequency.setValueAtTime(660, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(990, ctx.currentTime + 0.18);
+    } else {
+      osc.frequency.setValueAtTime(440, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.22);
+    }
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.32);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.34);
+  } catch {}
 }
 
 // ========================================================
@@ -413,6 +478,71 @@ function calculateQuantScore(ticker, allData, regime) {
 // ========================================================
 // UI COMPONENTS
 // ========================================================
+function AlertToggle({ label, checked, onChange }) {
+  return (
+    <label style={{
+      display: "flex", alignItems: "center", gap: 10,
+      padding: "6px 0", cursor: "pointer", userSelect: "none",
+    }}>
+      <span
+        onClick={() => onChange(!checked)}
+        style={{
+          width: 36, height: 20, borderRadius: 999,
+          background: checked ? "#4ade80" : "rgba(255,255,255,0.15)",
+          position: "relative", transition: "background 0.2s",
+          flexShrink: 0,
+        }}
+      >
+        <span style={{
+          position: "absolute", top: 2, left: checked ? 18 : 2,
+          width: 16, height: 16, borderRadius: "50%",
+          background: "#fff", transition: "left 0.2s",
+        }} />
+      </span>
+      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.78)", lineHeight: 1.4 }}>
+        {label}
+      </span>
+    </label>
+  );
+}
+
+function ToastStack({ toasts, onDismiss }) {
+  if (!toasts.length) return null;
+  return (
+    <div style={{
+      position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)",
+      width: "100%", maxWidth: 380, padding: "0 12px",
+      zIndex: 9999, display: "flex", flexDirection: "column", gap: 8,
+      pointerEvents: "none",
+    }}>
+      {toasts.map(t => (
+        <div key={t.id}
+          onClick={() => onDismiss(t.id)}
+          style={{
+            pointerEvents: "auto", cursor: "pointer",
+            background: t.kind === "buy"
+              ? "linear-gradient(135deg, rgba(74,222,128,0.22), rgba(34,197,94,0.10))"
+              : "linear-gradient(135deg, rgba(248,113,113,0.22), rgba(220,38,38,0.10))",
+            border: `1px solid ${t.kind === "buy" ? "rgba(74,222,128,0.45)" : "rgba(248,113,113,0.45)"}`,
+            backdropFilter: "blur(20px)",
+            WebkitBackdropFilter: "blur(20px)",
+            borderRadius: 14, padding: "10px 14px",
+            boxShadow: "0 8px 28px rgba(0,0,0,0.4)",
+            animation: "slideUp 0.25s ease",
+            color: "#fff",
+          }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 2 }}>
+            {t.title}
+          </div>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.78)", lineHeight: 1.4 }}>
+            {t.body}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function LoadingDots({ color = "currentColor" }) {
   return (
     <span style={{ display: "inline-flex", gap: 4 }}>
@@ -1323,15 +1453,92 @@ export default function StockQuantL3() {
   const [aiLoading, setAiLoading] = useState(false);
   const [tab, setTab] = useState("signals");
   const [positions, setPositions] = useState({});
+  const [alerts, setAlerts] = useState(DEFAULT_ALERTS);
+  const [notifyPerm, setNotifyPerm] = useState(
+    canNotify() ? Notification.permission : "unsupported"
+  );
+  const [toasts, setToasts] = useState([]);
+  const prevQuantsRef = useRef({});
 
-  // Load API key on mount
+  // Load API key + positions + alert prefs on mount
   useEffect(() => {
     loadApiKey().then(k => {
       setApiKey(k);
       setKeyLoaded(true);
     });
     loadPositions().then(setPositions);
+    loadAlertSettings().then(setAlerts);
   }, []);
+
+  function pushToast(t) {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev, { id, ...t }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(x => x.id !== id));
+    }, 8000);
+  }
+
+  function updateAlerts(patch) {
+    setAlerts(prev => {
+      const next = { ...prev, ...patch };
+      saveAlertSettings(next);
+      return next;
+    });
+  }
+
+  // Detect verdict / z-score transitions and fire alerts
+  useEffect(() => {
+    if (!alerts.enabled) { prevQuantsRef.current = quants; return; }
+    const prev = prevQuantsRef.current || {};
+    const fired = [];
+    Object.keys(quants).forEach(t => {
+      const cur = quants[t];
+      const old = prev[t];
+      if (!cur) return;
+      const info = STOCKS[t] || {};
+      const tName = `${info.icon || ""} ${t}`;
+
+      // Verdict transitions to Strong Buy / Strong Sell
+      if (alerts.notifyExtreme && old && old.verdict !== cur.verdict) {
+        if (cur.verdict === "Strong Buy" && old.verdict !== "Strong Buy") {
+          fired.push({ kind: "buy", title: `🚀 STRONG BUY · ${t}`,
+            body: `${info.name || t} score ${cur.score}/100 (z=${cur.zscore.toFixed(2)})` });
+        } else if (cur.verdict === "Strong Sell" && old.verdict !== "Strong Sell") {
+          fired.push({ kind: "sell", title: `⚠️ STRONG SELL · ${t}`,
+            body: `${info.name || t} score ${cur.score}/100 (z=${cur.zscore.toFixed(2)})` });
+        }
+      }
+
+      // Z-score extreme crossings
+      if (alerts.notifyZ && old && cur.zscore != null && old.zscore != null) {
+        const oZ = old.zscore, nZ = cur.zscore;
+        if (oZ > -2 && nZ <= -2) {
+          fired.push({ kind: "buy", title: `🟢 OVERSOLD · ${t}`,
+            body: `z-score = ${nZ.toFixed(2)} · เด้งกลับมีโอกาสสูง` });
+        } else if (oZ < 2 && nZ >= 2) {
+          fired.push({ kind: "sell", title: `🔴 OVERBOUGHT · ${t}`,
+            body: `z-score = +${nZ.toFixed(2)} · ระวังย่อพักฐาน` });
+        }
+      }
+    });
+
+    if (fired.length) {
+      fired.forEach(f => {
+        pushToast(f);
+        fireBrowserNotification(f.title, f.body);
+      });
+      if (alerts.sound) beep(fired[0].kind);
+    }
+    prevQuantsRef.current = quants;
+  }, [quants]);
+
+  // Auto-refresh on interval
+  useEffect(() => {
+    if (!apiKey || !alerts.enabled) return;
+    const ms = Math.max(1, alerts.refreshMin) * 60_000;
+    const id = setInterval(() => { loadAll(); }, ms);
+    return () => clearInterval(id);
+  }, [apiKey, alerts.enabled, alerts.refreshMin]);
 
   function addEntry(ticker, entry) {
     setPositions(prev => {
@@ -1496,6 +1703,8 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         @keyframes pulseRed { 0%,100%{opacity:1} 50%{opacity:0.5} }
       `}</style>
 
+      <ToastStack toasts={toasts} onDismiss={(id) => setToasts(p => p.filter(t => t.id !== id))} />
+
       <div style={{ maxWidth: 390, margin: "0 auto", minHeight: "100vh", paddingBottom: 100 }}>
 
         {/* Status bar */}
@@ -1529,6 +1738,13 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
               }} />
               FINNHUB · REAL-TIME
               {lastUpdate && ` · ${lastUpdate.toLocaleTimeString("th-TH")}`}
+              {alerts.enabled && (
+                <span style={{
+                  marginLeft: 6, padding: "1px 6px", borderRadius: 6,
+                  background: "rgba(74,222,128,0.15)",
+                  color: "#4ade80", fontSize: 9, fontWeight: 700,
+                }}>🔔 {alerts.refreshMin}m</span>
+              )}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
@@ -1570,6 +1786,105 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
               border: "1px solid rgba(248,113,113,0.3)",
               color: "#f87171", fontSize: 11, cursor: "pointer",
             }}>🗑️ ลบ API Key</button>
+
+            {/* Alert settings */}
+            <div style={{
+              marginTop: 14, paddingTop: 14,
+              borderTop: "1px solid rgba(255,255,255,0.06)",
+            }}>
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginBottom: 10, fontWeight: 700 }}>
+                🔔 การแจ้งเตือน
+              </div>
+
+              <AlertToggle
+                label="เปิดใช้งาน auto-refresh + alerts"
+                checked={alerts.enabled}
+                onChange={v => updateAlerts({ enabled: v })}
+              />
+              <AlertToggle
+                label="แจ้งเมื่อเป็น Strong Buy / Strong Sell"
+                checked={alerts.notifyExtreme}
+                onChange={v => updateAlerts({ notifyExtreme: v })}
+              />
+              <AlertToggle
+                label="แจ้งเมื่อ z-score ทะลุ ±2 (oversold/overbought)"
+                checked={alerts.notifyZ}
+                onChange={v => updateAlerts({ notifyZ: v })}
+              />
+              <AlertToggle
+                label="🔊 เสียงเตือน"
+                checked={alerts.sound}
+                onChange={v => updateAlerts({ sound: v })}
+              />
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "10px 0 6px" }}>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.7)" }}>เช็คทุก</span>
+                <select
+                  value={alerts.refreshMin}
+                  onChange={e => updateAlerts({ refreshMin: Number(e.target.value) })}
+                  style={{
+                    background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.12)",
+                    color: "#fff", padding: "5px 8px", borderRadius: 8,
+                    fontSize: 11,
+                  }}
+                >
+                  <option value={1}>1 นาที</option>
+                  <option value={3}>3 นาที</option>
+                  <option value={5}>5 นาที</option>
+                  <option value={10}>10 นาที</option>
+                  <option value={15}>15 นาที</option>
+                  <option value={30}>30 นาที</option>
+                </select>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                <button
+                  onClick={async () => {
+                    const p = await requestNotifyPermission();
+                    setNotifyPerm(p);
+                    if (p === "granted") {
+                      fireBrowserNotification("✅ เปิดแจ้งเตือนสำเร็จ", "Quant L3 จะเตือนเมื่อมีสัญญาณ extreme");
+                    }
+                  }}
+                  style={{
+                    flex: 1, padding: "8px 12px", borderRadius: 10,
+                    background: notifyPerm === "granted" ? "rgba(74,222,128,0.15)" : "rgba(99,102,241,0.18)",
+                    border: `1px solid ${notifyPerm === "granted" ? "rgba(74,222,128,0.35)" : "rgba(99,102,241,0.4)"}`,
+                    color: notifyPerm === "granted" ? "#4ade80" : "#a5b4fc",
+                    fontSize: 10.5, cursor: "pointer", fontWeight: 600,
+                  }}
+                >
+                  {notifyPerm === "granted" ? "✅ Browser notify ON"
+                    : notifyPerm === "denied" ? "🚫 ถูกบล็อก (ตั้งค่าใน Safari)"
+                    : notifyPerm === "unsupported" ? "❌ Browser ไม่รองรับ"
+                    : "🔔 ขออนุญาตแจ้งเตือน"}
+                </button>
+                <button
+                  onClick={() => {
+                    pushToast({ kind: "buy", title: "🧪 ทดสอบเตือน", body: "ถ้าเห็นข้อความนี้แปลว่าใช้งานได้" });
+                    if (alerts.sound) beep("buy");
+                    fireBrowserNotification("🧪 ทดสอบเตือน", "Quant L3 alert test");
+                  }}
+                  style={{
+                    padding: "8px 12px", borderRadius: 10,
+                    background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.12)",
+                    color: "#fff", fontSize: 10.5, cursor: "pointer",
+                  }}
+                >🧪 ทดสอบ</button>
+              </div>
+
+              <div style={{
+                marginTop: 10, padding: 8, borderRadius: 8,
+                background: "rgba(245,158,11,0.06)",
+                border: "1px solid rgba(245,158,11,0.18)",
+                fontSize: 10, color: "rgba(255,255,255,0.55)", lineHeight: 1.5,
+              }}>
+                💡 บน iPhone: notification ผุดได้เฉพาะตอนเปิดแอปไว้
+                หรือ "เพิ่มลง Home Screen" (PWA) แล้วเปิดสแตนด์อโลน
+              </div>
+            </div>
           </div>
         )}
 
