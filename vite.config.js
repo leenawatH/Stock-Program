@@ -36,6 +36,13 @@ export default defineConfig({
         secure: true,
         rewrite: (p) => p.replace(/^\/api\/fx/, ""),
       },
+      "/api/translate": {
+        target: "https://translate.googleapis.com",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (p) => p.replace(/^\/api\/translate/, ""),
+        headers: { "User-Agent": BROWSER_UA },
+      },
     },
   },
 });

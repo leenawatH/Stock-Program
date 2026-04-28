@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine, BarChart, Bar, Cell } from "recharts";
 
 // ========================================================
@@ -8,6 +8,7 @@ const STOCKS = {
   NVDA:       { name: "NVIDIA",          color: "#76b900", icon: "⚡", kind: "stock" },
   GOOGL:      { name: "Alphabet",        color: "#4285f4", icon: "🔍", kind: "stock" },
   BAC:        { name: "Bank of America", color: "#e31837", icon: "🏦", kind: "stock" },
+  GLD:        { name: "Gold ETF",        color: "#ffd700", icon: "🥇", kind: "safe_haven" },
   "BTC-USD":  { name: "Bitcoin",         color: "#f7931a", icon: "₿", kind: "crypto", finnhub: "BINANCE:BTCUSDT" },
   "DOGE-USD": { name: "Dogecoin",        color: "#c2a633", icon: "🐕", kind: "crypto", finnhub: "BINANCE:DOGEUSDT" },
 };
@@ -50,71 +51,6 @@ async function savePositions(obj) {
 }
 
 // ========================================================
-// ALERT SETTINGS + NOTIFICATIONS
-// ========================================================
-const DEFAULT_ALERTS = {
-  enabled: true,
-  refreshMin: 5,        // auto-refresh interval
-  notifyExtreme: true,  // verdict transitions to Strong Buy/Sell
-  notifyZ: true,        // |z| crosses 2
-  sound: true,
-};
-
-async function loadAlertSettings() {
-  try {
-    const r = await window.storage.get("alerts_v1");
-    if (!r?.value) return DEFAULT_ALERTS;
-    return { ...DEFAULT_ALERTS, ...JSON.parse(r.value) };
-  } catch { return DEFAULT_ALERTS; }
-}
-async function saveAlertSettings(obj) {
-  try { await window.storage.set("alerts_v1", JSON.stringify(obj)); } catch {}
-}
-
-function canNotify() {
-  return typeof window !== "undefined"
-    && "Notification" in window;
-}
-async function requestNotifyPermission() {
-  if (!canNotify()) return "unsupported";
-  if (Notification.permission === "granted") return "granted";
-  if (Notification.permission === "denied") return "denied";
-  try { return await Notification.requestPermission(); }
-  catch { return "denied"; }
-}
-function fireBrowserNotification(title, body) {
-  if (!canNotify() || Notification.permission !== "granted") return;
-  try {
-    new Notification(title, { body, icon: "/vite.svg", badge: "/vite.svg", tag: "quant-l3" });
-  } catch {}
-}
-
-// Web Audio beep (no asset needed) — different tones for buy/sell
-function beep(kind = "buy") {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.type = "sine";
-    if (kind === "buy") {
-      osc.frequency.setValueAtTime(660, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(990, ctx.currentTime + 0.18);
-    } else {
-      osc.frequency.setValueAtTime(440, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.22);
-    }
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.32);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.34);
-  } catch {}
-}
-
-// ========================================================
 // DATA FETCHING
 // ========================================================
 async function fetchFinnhubCandles(symbol, apiKey, days = 180) {
@@ -143,6 +79,43 @@ async function fetchFinnhubQuote(symbol, apiKey) {
     const res = await fetch(url);
     return await res.json();
   } catch (e) { return null; }
+}
+
+async function fetchCompanyNews(symbol, apiKey, days = 7) {
+  const today = new Date();
+  const past = new Date(today.getTime() - days * 86400000);
+  const fmt = d => d.toISOString().slice(0, 10);
+  const url = `/api/finnhub/api/v1/company-news?symbol=${symbol}&from=${fmt(past)}&to=${fmt(today)}&token=${apiKey}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+async function fetchCryptoNews(apiKey) {
+  const url = `/api/finnhub/api/v1/news?category=crypto&token=${apiKey}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+// Google Translate (free, no API key) — proxied via /api/translate
+async function translateText(text, target = "th") {
+  if (!text || typeof text !== "string") return text;
+  // Google has a hard limit ~5000 chars per call; truncate to be safe
+  const q = text.slice(0, 4500);
+  const url = `/api/translate/translate_a/single?client=gtx&sl=auto&tl=${target}&dt=t&q=${encodeURIComponent(q)}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return text;
+    const data = await res.json();
+    const segs = data?.[0];
+    if (!Array.isArray(segs)) return text;
+    return segs.map(s => s?.[0] || "").join("");
+  } catch { return text; }
 }
 
 async function fetchYahoo(symbol, range = "6mo", interval = "1d") {
@@ -429,10 +402,14 @@ function calculateQuantScore(ticker, allData, regime) {
   const tInfo = STOCKS[ticker] || {};
   const riskOn = ["NVDA", "GOOGL"].includes(ticker) || tInfo.kind === "crypto";
   const riskNeutral = ticker === "BAC";
+  const safeHaven = tInfo.kind === "safe_haven";
   if (riskOn && regime.score > 60) { score += 12; signals.push({ name: "Regime", value: regime.regime, sig: "Favors this stock", type: "bull" }); }
   else if (riskOn && regime.score < 40) { score -= 12; signals.push({ name: "Regime", value: regime.regime, sig: "Against this stock", type: "bear" }); }
   else if (riskNeutral && regime.score > 55) { score += 5; signals.push({ name: "Regime", value: regime.regime, sig: "Neutral for banks", type: "neutral" }); }
   else if (riskNeutral && regime.score < 45) { score += 5; signals.push({ name: "Regime", value: regime.regime, sig: "Banks may benefit", type: "bull" }); }
+  else if (safeHaven && regime.score < 40) { score += 12; signals.push({ name: "Regime", value: regime.regime, sig: "Risk-off favors safe haven", type: "bull" }); }
+  else if (safeHaven && regime.score > 65) { score -= 8; signals.push({ name: "Regime", value: regime.regime, sig: "Risk-on, capital flows to equities", type: "bear" }); }
+  else if (safeHaven) { signals.push({ name: "Regime", value: regime.regime, sig: "Neutral for gold", type: "neutral" }); }
   else { signals.push({ name: "Regime", value: regime.regime, sig: "Neutral", type: "neutral" }); }
 
   // 4. Momentum (10-day vs 30-day) - 10 points
@@ -478,67 +455,724 @@ function calculateQuantScore(ticker, allData, regime) {
 // ========================================================
 // UI COMPONENTS
 // ========================================================
-function AlertToggle({ label, checked, onChange }) {
+function PairsView({ allData }) {
+  const tickers = Object.keys(STOCKS).filter(t => allData[t]?.prices?.length >= 60);
+  const pairs = [];
+  for (let i = 0; i < tickers.length; i++) {
+    for (let j = i + 1; j < tickers.length; j++) {
+      const a = tickers[i], b = tickers[j];
+      const pa = allData[a].prices, pb = allData[b].prices;
+      const n = Math.min(pa.length, pb.length, 60);
+      const corr = correlation(pa.slice(-n), pb.slice(-n));
+      // spread (price ratio) z-score
+      const ratios = [];
+      for (let k = 1; k <= n; k++) ratios.push(pa[pa.length - k] / pb[pb.length - k]);
+      ratios.reverse();
+      const z = zScore(ratios, Math.min(30, ratios.length));
+      pairs.push({ a, b, corr, z });
+    }
+  }
+  pairs.sort((p, q) => Math.abs(q.z) - Math.abs(p.z));
+
   return (
-    <label style={{
-      display: "flex", alignItems: "center", gap: 10,
-      padding: "6px 0", cursor: "pointer", userSelect: "none",
-    }}>
-      <span
-        onClick={() => onChange(!checked)}
-        style={{
-          width: 36, height: 20, borderRadius: 999,
-          background: checked ? "#4ade80" : "rgba(255,255,255,0.15)",
-          position: "relative", transition: "background 0.2s",
-          flexShrink: 0,
-        }}
-      >
-        <span style={{
-          position: "absolute", top: 2, left: checked ? 18 : 2,
-          width: 16, height: 16, borderRadius: "50%",
-          background: "#fff", transition: "left 0.2s",
-        }} />
-      </span>
-      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.78)", lineHeight: 1.4 }}>
-        {label}
-      </span>
-    </label>
+    <div>
+      <div style={{
+        background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)",
+        borderRadius: 12, padding: 12, marginBottom: 12,
+      }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#a5b4fc", marginBottom: 6 }}>
+          🔗 Pairs Trading
+        </div>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.7)", lineHeight: 1.5 }}>
+          เทรดส่วนต่างของคู่หุ้น ถ้า spread (ratio A/B) ผิดไปจากปกติ &gt;2σ → คาดว่าจะกลับมา → Long ตัวที่ถูก / Short ตัวที่แพง
+        </div>
+      </div>
+
+      {pairs.map(p => {
+        const aInfo = STOCKS[p.a] || {}, bInfo = STOCKS[p.b] || {};
+        const signal = Math.abs(p.z) > 2 ? "STRONG"
+                     : Math.abs(p.z) > 1 ? "WATCH" : "NEUTRAL";
+        const longSide = p.z > 0 ? p.b : p.a;
+        const shortSide = p.z > 0 ? p.a : p.b;
+        const sigColor = signal === "STRONG" ? "#4ade80"
+                       : signal === "WATCH" ? "#fbbf24" : "rgba(255,255,255,0.4)";
+        return (
+          <div key={`${p.a}-${p.b}`} style={{
+            background: "rgba(255,255,255,0.04)",
+            border: `1px solid ${signal === "STRONG" ? "rgba(74,222,128,0.3)" : "rgba(255,255,255,0.06)"}`,
+            borderRadius: 12, padding: 12, marginBottom: 8,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>
+                <span style={{ color: aInfo.color }}>{p.a}</span>
+                <span style={{ opacity: 0.5, margin: "0 6px" }}>/</span>
+                <span style={{ color: bInfo.color }}>{p.b}</span>
+              </div>
+              <span style={{
+                fontSize: 9, fontWeight: 700, color: sigColor,
+                padding: "2px 8px", borderRadius: 6,
+                background: `${sigColor}22`, border: `1px solid ${sigColor}55`,
+              }}>{signal}</span>
+            </div>
+            <div style={{ display: "flex", gap: 12, fontSize: 10.5, color: "rgba(255,255,255,0.7)", fontFamily: "'Space Mono', monospace" }}>
+              <span>corr: <b style={{ color: Math.abs(p.corr) > 0.5 ? "#a5b4fc" : "rgba(255,255,255,0.5)" }}>{p.corr.toFixed(2)}</b></span>
+              <span>spread z: <b style={{ color: Math.abs(p.z) > 2 ? "#4ade80" : Math.abs(p.z) > 1 ? "#fbbf24" : "rgba(255,255,255,0.5)" }}>
+                {p.z >= 0 ? "+" : ""}{p.z.toFixed(2)}
+              </b></span>
+            </div>
+            {signal === "STRONG" && (
+              <div style={{
+                marginTop: 8, padding: "6px 8px", borderRadius: 8,
+                background: "rgba(74,222,128,0.08)", fontSize: 10.5, color: "rgba(255,255,255,0.85)",
+              }}>
+                💡 Long <b style={{ color: "#4ade80" }}>{longSide}</b> · Short <b style={{ color: "#f87171" }}>{shortSide}</b>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {pairs.length === 0 && (
+        <div style={{ padding: 20, textAlign: "center", color: "rgba(255,255,255,0.4)", fontSize: 12 }}>
+          ยังไม่มีข้อมูลพอสำหรับวิเคราะห์ pairs
+        </div>
+      )}
+    </div>
   );
 }
 
-function ToastStack({ toasts, onDismiss }) {
-  if (!toasts.length) return null;
+function PortfolioView({ positions, allData, quants, regime, onSelect, onRemoveEntry }) {
+  const tickers = Object.keys(positions).filter(t => positions[t]?.length);
+  let totalPnl = 0, totalCost = 0, totalValue = 0;
+  let actionCounts = { sellNow: 0, takePart: 0, hold: 0, addMore: 0 };
+  const rows = tickers.map(t => {
+    const cur = allData[t]?.current;
+    const sum = summarizePosition(positions[t], cur);
+    const plan = (allData[t] && quants[t] && regime)
+      ? calculateExitPlan(t, allData[t], quants[t], regime, positions[t])
+      : null;
+    if (sum) {
+      totalPnl += sum.pnl || 0;
+      totalCost += sum.totalCost || 0;
+      totalValue += sum.currentValue || 0;
+    }
+    if (plan) {
+      const u = plan.urgency;
+      const verdict = quants[t]?.verdict;
+      if (u === "critical") actionCounts.sellNow++;
+      else if (u === "high" || u === "medium" || u === "watch") actionCounts.takePart++;
+      else if (verdict === "Strong Buy" || verdict === "Buy") actionCounts.addMore++;
+      else actionCounts.hold++;
+    }
+    return { t, sum, cur, plan, quant: quants[t] };
+  });
+  const totalPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
+
+  if (!tickers.length) {
+    return (
+      <div style={{
+        padding: 30, textAlign: "center",
+        background: "rgba(255,255,255,0.03)", borderRadius: 14,
+        border: "1px solid rgba(255,255,255,0.06)",
+      }}>
+        <div style={{ fontSize: 32, marginBottom: 10 }}>📭</div>
+        <div style={{ fontSize: 13, color: "rgba(255,255,255,0.7)", marginBottom: 6 }}>
+          ยังไม่มี position
+        </div>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", lineHeight: 1.6 }}>
+          ไปที่ Quant → เลือกหุ้น → tab 🚪 Exit → เพิ่มข้อมูลการซื้อ
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div style={{
-      position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)",
-      width: "100%", maxWidth: 380, padding: "0 12px",
-      zIndex: 9999, display: "flex", flexDirection: "column", gap: 8,
-      pointerEvents: "none",
-    }}>
-      {toasts.map(t => (
-        <div key={t.id}
-          onClick={() => onDismiss(t.id)}
-          style={{
-            pointerEvents: "auto", cursor: "pointer",
-            background: t.kind === "buy"
-              ? "linear-gradient(135deg, rgba(74,222,128,0.22), rgba(34,197,94,0.10))"
-              : "linear-gradient(135deg, rgba(248,113,113,0.22), rgba(220,38,38,0.10))",
-            border: `1px solid ${t.kind === "buy" ? "rgba(74,222,128,0.45)" : "rgba(248,113,113,0.45)"}`,
-            backdropFilter: "blur(20px)",
-            WebkitBackdropFilter: "blur(20px)",
-            borderRadius: 14, padding: "10px 14px",
-            boxShadow: "0 8px 28px rgba(0,0,0,0.4)",
-            animation: "slideUp 0.25s ease",
-            color: "#fff",
+    <div>
+      {/* Portfolio summary */}
+      <div style={{
+        background: `linear-gradient(135deg, ${totalPnl >= 0 ? "rgba(74,222,128,0.15)" : "rgba(248,113,113,0.15)"}, rgba(0,0,0,0.5))`,
+        border: `1px solid ${totalPnl >= 0 ? "rgba(74,222,128,0.3)" : "rgba(248,113,113,0.3)"}`,
+        borderRadius: 16, padding: 16, marginBottom: 14,
+      }}>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, marginBottom: 6 }}>
+          TOTAL PORTFOLIO
+        </div>
+        <div style={{
+          fontSize: 26, fontWeight: 800, fontFamily: "'Space Mono', monospace",
+          color: totalPnl >= 0 ? "#4ade80" : "#f87171",
+        }}>
+          {totalPnl >= 0 ? "+" : ""}${totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}
+        </div>
+        <div style={{
+          fontSize: 12, fontFamily: "'Space Mono', monospace",
+          color: totalPnl >= 0 ? "#4ade80" : "#f87171", marginTop: 2,
+        }}>
+          {totalPct >= 0 ? "+" : ""}{totalPct.toFixed(2)}%
+        </div>
+        <div style={{ display: "flex", gap: 14, marginTop: 12, fontSize: 10.5, color: "rgba(255,255,255,0.7)", fontFamily: "'Space Mono', monospace" }}>
+          <span>Cost: <b>${totalCost.toLocaleString("en-US", { maximumFractionDigits: 0 })}</b></span>
+          <span>Value: <b>${totalValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}</b></span>
+        </div>
+      </div>
+
+      {/* Action summary bar */}
+      {(actionCounts.sellNow + actionCounts.takePart + actionCounts.addMore + actionCounts.hold) > 0 && (
+        <div style={{
+          display: "flex", gap: 6, marginBottom: 12, fontSize: 10,
+        }}>
+          {actionCounts.sellNow > 0 && (
+            <span style={{
+              flex: 1, padding: "6px 8px", borderRadius: 8, textAlign: "center",
+              background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)", color: "#fca5a5",
+            }}>🔴 ขาย {actionCounts.sellNow}</span>
+          )}
+          {actionCounts.takePart > 0 && (
+            <span style={{
+              flex: 1, padding: "6px 8px", borderRadius: 8, textAlign: "center",
+              background: "rgba(234,179,8,0.15)", border: "1px solid rgba(234,179,8,0.3)", color: "#fde68a",
+            }}>🟡 ทยอย {actionCounts.takePart}</span>
+          )}
+          {actionCounts.hold > 0 && (
+            <span style={{
+              flex: 1, padding: "6px 8px", borderRadius: 8, textAlign: "center",
+              background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.3)", color: "#a5b4fc",
+            }}>⏳ ถือ {actionCounts.hold}</span>
+          )}
+          {actionCounts.addMore > 0 && (
+            <span style={{
+              flex: 1, padding: "6px 8px", borderRadius: 8, textAlign: "center",
+              background: "rgba(74,222,128,0.15)", border: "1px solid rgba(74,222,128,0.3)", color: "#86efac",
+            }}>🟢 ซื้อเพิ่ม {actionCounts.addMore}</span>
+          )}
+        </div>
+      )}
+
+      {/* Per-ticker breakdown */}
+      {rows.map(({ t, sum, cur, plan, quant }) => {
+        if (!sum) return null;
+        const info = STOCKS[t] || {};
+        const isWin = sum.pnl >= 0;
+        const verdictColor = quant?.verdict === "Strong Buy" ? "#4ade80"
+                          : quant?.verdict === "Buy" ? "#86efac"
+                          : quant?.verdict === "Hold" ? "#fbbf24"
+                          : quant?.verdict === "Sell" ? "#f97316"
+                          : quant?.verdict === "Strong Sell" ? "#ef4444"
+                          : "rgba(255,255,255,0.5)";
+        return (
+          <div key={t} style={{
+            background: "rgba(255,255,255,0.03)",
+            border: `1px solid ${plan?.urgency === "critical" ? "rgba(239,68,68,0.35)"
+                              : plan?.urgency === "high" ? "rgba(249,115,22,0.3)"
+                              : "rgba(255,255,255,0.06)"}`,
+            borderRadius: 14, padding: 12, marginBottom: 10,
           }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 2 }}>
-            {t.title}
+            {/* Header: ticker + P&L */}
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginBottom: 10, cursor: "pointer",
+            }} onClick={() => onSelect && onSelect(t)}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 18 }}>{info.icon}</span>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: info.color }}>{t}</span>
+                    {quant && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, color: verdictColor,
+                        padding: "1px 6px", borderRadius: 5,
+                        background: `${verdictColor}22`, border: `1px solid ${verdictColor}55`,
+                      }}>{quant.verdict} · {quant.score}</span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>
+                    {sum.totalQty}u · avg {fmtPrice(sum.avgCost, t)} · now {fmtPrice(cur, t)} · {sum.daysHeld}d
+                  </div>
+                </div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div style={{
+                  fontSize: 13, fontWeight: 700,
+                  color: isWin ? "#4ade80" : "#f87171",
+                  fontFamily: "'Space Mono', monospace",
+                }}>
+                  {isWin ? "+" : ""}{fmtPrice(sum.pnl, t)}
+                </div>
+                <div style={{
+                  fontSize: 10, color: isWin ? "#4ade80" : "#f87171",
+                  fontFamily: "'Space Mono', monospace",
+                }}>
+                  {isWin ? "+" : ""}{sum.gainPct.toFixed(2)}%
+                </div>
+              </div>
+            </div>
+
+            {/* Action card from exit plan */}
+            {plan && (
+              <div style={{
+                padding: 10, borderRadius: 10, marginBottom: 8,
+                background: `${plan.color}15`,
+                border: `1px solid ${plan.color}40`,
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: plan.color, marginBottom: 4, lineHeight: 1.4 }}>
+                  {plan.action}
+                </div>
+                {plan.profitPlan && (
+                  <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.78)", lineHeight: 1.5, marginTop: 4 }}>
+                    📈 <b style={{ color: "#fff" }}>{plan.profitPlan.stage}</b> · {plan.profitPlan.stageAction}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* TP/SL row */}
+            {plan && (
+              <div style={{
+                display: "flex", gap: 6, marginBottom: 8, fontSize: 10,
+                fontFamily: "'Space Mono', monospace",
+              }}>
+                <div style={{
+                  flex: 1, padding: "5px 8px", borderRadius: 8,
+                  background: "rgba(74,222,128,0.08)", border: "1px solid rgba(74,222,128,0.2)",
+                }}>
+                  <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 8 }}>TP1</div>
+                  <div style={{ color: "#4ade80", fontWeight: 700 }}>{fmtPrice(plan.tp1, t)}</div>
+                </div>
+                <div style={{
+                  flex: 1, padding: "5px 8px", borderRadius: 8,
+                  background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.2)",
+                }}>
+                  <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 8 }}>SL</div>
+                  <div style={{ color: "#f87171", fontWeight: 700 }}>
+                    {plan.profitPlan?.suggestedSL ? fmtPrice(plan.profitPlan.suggestedSL, t) : fmtPrice(plan.sl, t)}
+                  </div>
+                </div>
+                <div style={{
+                  flex: 1, padding: "5px 8px", borderRadius: 8,
+                  background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)",
+                }}>
+                  <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 8 }}>Trail</div>
+                  <div style={{ color: "#a5b4fc", fontWeight: 700 }}>{fmtPrice(plan.trail, t)}</div>
+                </div>
+              </div>
+            )}
+
+            {/* Top sell triggers (HIGH severity only) */}
+            {plan?.triggers?.filter(tr => tr.sev === "high" || tr.sev === "critical").slice(0, 2).map((tr, i) => (
+              <div key={i} style={{
+                fontSize: 10.5, color: "rgba(255,255,255,0.75)",
+                padding: "4px 8px", borderRadius: 7,
+                background: "rgba(248,113,113,0.06)",
+                marginBottom: 4, lineHeight: 1.4,
+              }}>
+                ⚠️ {tr.text}
+              </div>
+            ))}
+
+            {/* Entry list */}
+            <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: 8, marginTop: 4 }}>
+              <div style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                fontSize: 9, color: "rgba(255,255,255,0.35)", letterSpacing: 0.5, marginBottom: 6,
+              }}>
+                <span>ENTRIES ({sum.entries.length})</span>
+                <span>avg cost {fmtPrice(sum.avgCost, t)}</span>
+              </div>
+              {sum.entries.map(e => {
+                const entryPrice = Number(e.price);
+                const entryQty = Number(e.qty);
+                const entryPnlPct = ((cur - entryPrice) / entryPrice) * 100;
+                const entryPnlUsd = (cur - entryPrice) * entryQty;
+                const daysHeld = e.date
+                  ? Math.max(0, Math.round((Date.now() - new Date(e.date).getTime()) / 86400000))
+                  : null;
+                // Per-entry: where is this entry relative to TP1 and SL from current price?
+                let vsContext = null;
+                if (plan?.tp1 && plan?.sl) {
+                  const toTp1 = ((plan.tp1 - cur) / cur) * 100;
+                  const toSl = ((cur - plan.sl) / cur) * 100;
+                  vsContext = { toTp1, toSl };
+                }
+                return (
+                  <div key={e.id} style={{
+                    padding: "6px 8px", marginBottom: 4, borderRadius: 8,
+                    background: "rgba(255,255,255,0.02)",
+                    border: `1px solid ${entryPnlPct >= 0 ? "rgba(74,222,128,0.12)" : "rgba(248,113,113,0.12)"}`,
+                  }}>
+                    <div style={{
+                      display: "flex", justifyContent: "space-between", alignItems: "center",
+                      fontSize: 10.5, fontFamily: "'Space Mono', monospace",
+                    }}>
+                      <span style={{ color: "rgba(255,255,255,0.75)" }}>
+                        {e.date || "—"} · <b style={{ color: "#fff" }}>{entryQty}u</b> @ {fmtPrice(entryPrice, t)}
+                        {daysHeld !== null && (
+                          <span style={{ color: "rgba(255,255,255,0.4)", marginLeft: 4 }}>
+                            ({daysHeld}d)
+                          </span>
+                        )}
+                      </span>
+                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ textAlign: "right" }}>
+                          <div style={{
+                            color: entryPnlPct >= 0 ? "#4ade80" : "#f87171",
+                            fontSize: 10.5, fontWeight: 700,
+                          }}>
+                            {entryPnlPct >= 0 ? "+" : ""}{entryPnlPct.toFixed(1)}%
+                          </div>
+                          <div style={{
+                            color: entryPnlUsd >= 0 ? "#4ade80" : "#f87171",
+                            fontSize: 9, opacity: 0.8,
+                          }}>
+                            {entryPnlUsd >= 0 ? "+" : ""}{fmtPrice(entryPnlUsd, t)}
+                          </div>
+                        </span>
+                        <button onClick={(ev) => { ev.stopPropagation(); onRemoveEntry && onRemoveEntry(t, e.id); }} style={{
+                          background: "none", border: "none", color: "rgba(248,113,113,0.6)",
+                          cursor: "pointer", fontSize: 14, padding: "0 4px",
+                        }}>×</button>
+                      </span>
+                    </div>
+                    {vsContext && (
+                      <div style={{
+                        marginTop: 4, display: "flex", gap: 8,
+                        fontSize: 9, fontFamily: "'Space Mono', monospace",
+                      }}>
+                        <span style={{ color: "rgba(74,222,128,0.7)" }}>
+                          → TP1 {vsContext.toTp1 >= 0 ? "+" : ""}{vsContext.toTp1.toFixed(1)}%
+                        </span>
+                        <span style={{ color: "rgba(248,113,113,0.7)" }}>
+                          ↓ SL {vsContext.toSl >= 0 ? "-" : "+"}{Math.abs(vsContext.toSl).toFixed(1)}%
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.78)", lineHeight: 1.4 }}>
-            {t.body}
+        );
+      })}
+    </div>
+  );
+}
+
+function NewsView({ apiKey }) {
+  const [newsByTicker, setNewsByTicker] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [activeTicker, setActiveTicker] = useState("ALL");
+  const [error, setError] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [translateOn, setTranslateOn] = useState(false);
+  const [translations, setTranslations] = useState({}); // text -> translated
+  const [translating, setTranslating] = useState(false);
+  const [expandedId, setExpandedId] = useState(null);
+
+  useEffect(() => {
+    if (!apiKey) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    (async () => {
+      try {
+        const result = {};
+        const stockTickers = Object.keys(STOCKS).filter(t => STOCKS[t].kind === "stock");
+        const cryptoTickers = Object.keys(STOCKS).filter(t => STOCKS[t].kind === "crypto");
+
+        const stockNews = await Promise.all(stockTickers.map(t => fetchCompanyNews(t, apiKey, 7)));
+        stockTickers.forEach((t, i) => { result[t] = (stockNews[i] || []).slice(0, 12); });
+
+        if (cryptoTickers.length) {
+          const cryptoFeed = await fetchCryptoNews(apiKey);
+          for (const t of cryptoTickers) {
+            const name = (STOCKS[t].name || "").toLowerCase();
+            const sym = t.split("-")[0].toLowerCase();
+            result[t] = cryptoFeed
+              .filter(n => {
+                const text = `${n.headline || ""} ${n.summary || ""}`.toLowerCase();
+                return text.includes(name) || text.includes(sym);
+              })
+              .slice(0, 12);
+          }
+        }
+
+        if (!cancelled) setNewsByTicker(result);
+      } catch (e) {
+        if (!cancelled) setError(String(e?.message || e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiKey, refreshKey]);
+
+  const tickers = Object.keys(STOCKS);
+  const allNews = tickers.flatMap(t =>
+    (newsByTicker[t] || []).map(n => ({ ...n, _ticker: t }))
+  );
+  const seen = new Set();
+  const uniqAll = allNews.filter(n => {
+    const key = n.id || `${n.headline}-${n.datetime}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((a, b) => (b.datetime || 0) - (a.datetime || 0));
+
+  const visible = activeTicker === "ALL" ? uniqAll : (newsByTicker[activeTicker] || []).map(n => ({ ...n, _ticker: activeTicker }));
+
+  // Auto-translate visible items when toggle is on
+  useEffect(() => {
+    if (!translateOn || visible.length === 0) return;
+    const pending = new Set();
+    visible.forEach(n => {
+      if (n.headline && translations[n.headline] === undefined) pending.add(n.headline);
+      if (n.summary && translations[n.summary] === undefined) pending.add(n.summary);
+    });
+    if (pending.size === 0) return;
+    let cancelled = false;
+    setTranslating(true);
+    (async () => {
+      const updates = {};
+      // Sequential — Google free endpoint rate-limits parallel calls
+      for (const t of pending) {
+        if (cancelled) break;
+        updates[t] = await translateText(t, "th");
+      }
+      if (!cancelled) {
+        setTranslations(prev => ({ ...prev, ...updates }));
+        setTranslating(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [translateOn, activeTicker, visible.length]);
+
+  const fmtTime = (ts) => {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const diffMs = Date.now() - d.getTime();
+    const mins = Math.floor(diffMs / 60000);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 7) return `${days}d ago`;
+    return d.toISOString().slice(0, 10);
+  };
+
+  return (
+    <div>
+      {/* Header + refresh */}
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        marginBottom: 12,
+      }}>
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>📰 ข่าวหุ้น</div>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>
+            7 วันย้อนหลัง · จาก Finnhub
           </div>
         </div>
-      ))}
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            onClick={() => setTranslateOn(v => !v)}
+            style={{
+              background: translateOn ? "rgba(74,222,128,0.18)" : "rgba(255,255,255,0.05)",
+              color: translateOn ? "#86efac" : "rgba(255,255,255,0.6)",
+              border: `1px solid ${translateOn ? "rgba(74,222,128,0.35)" : "rgba(255,255,255,0.1)"}`,
+              borderRadius: 8, padding: "6px 10px", fontSize: 11, cursor: "pointer",
+              fontWeight: translateOn ? 700 : 500,
+            }}
+          >
+            {translating ? "⏳" : "🌐"} {translateOn ? "ไทย" : "EN"}
+          </button>
+          <button
+            onClick={() => setRefreshKey(k => k + 1)}
+            disabled={loading}
+            style={{
+              background: "rgba(99,102,241,0.15)", color: "#a5b4fc",
+              border: "1px solid rgba(99,102,241,0.3)", borderRadius: 8,
+              padding: "6px 12px", fontSize: 11, cursor: loading ? "wait" : "pointer",
+              opacity: loading ? 0.5 : 1,
+            }}
+          >
+            {loading ? "⏳" : "🔄"} รีเฟรช
+          </button>
+        </div>
+      </div>
+
+      {/* Ticker filter chips */}
+      <div style={{
+        display: "flex", gap: 6, marginBottom: 14, overflowX: "auto",
+        paddingBottom: 4,
+      }}>
+        {["ALL", ...tickers].map(t => {
+          const isActive = activeTicker === t;
+          const info = STOCKS[t] || {};
+          const count = t === "ALL" ? uniqAll.length : (newsByTicker[t] || []).length;
+          return (
+            <button
+              key={t}
+              onClick={() => setActiveTicker(t)}
+              style={{
+                flexShrink: 0, padding: "6px 10px", borderRadius: 8,
+                background: isActive ? `${info.color || "#6366f1"}25` : "rgba(255,255,255,0.04)",
+                border: `1px solid ${isActive ? (info.color || "#6366f1") : "rgba(255,255,255,0.08)"}`,
+                color: isActive ? (info.color || "#a5b4fc") : "rgba(255,255,255,0.6)",
+                fontSize: 11, fontWeight: isActive ? 700 : 500, cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 4,
+              }}
+            >
+              {info.icon && <span>{info.icon}</span>}
+              <span>{t === "ALL" ? "ทั้งหมด" : t}</span>
+              {count > 0 && (
+                <span style={{
+                  fontSize: 9, opacity: 0.7, padding: "0 4px",
+                  background: "rgba(0,0,0,0.3)", borderRadius: 6,
+                }}>{count}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Loading state */}
+      {loading && (
+        <div style={{
+          padding: 30, textAlign: "center",
+          background: "rgba(255,255,255,0.03)", borderRadius: 14,
+          border: "1px solid rgba(255,255,255,0.06)",
+        }}>
+          <div style={{ fontSize: 24, marginBottom: 8 }}>📡</div>
+          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.6)" }}>
+            กำลังโหลดข่าว...
+          </div>
+        </div>
+      )}
+
+      {/* Error state */}
+      {error && !loading && (
+        <div style={{
+          padding: 16, borderRadius: 12,
+          background: "rgba(248,113,113,0.08)",
+          border: "1px solid rgba(248,113,113,0.3)",
+          fontSize: 12, color: "#fca5a5",
+        }}>
+          ⚠️ โหลดข่าวไม่ได้: {error}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!loading && !error && visible.length === 0 && (
+        <div style={{
+          padding: 30, textAlign: "center",
+          background: "rgba(255,255,255,0.03)", borderRadius: 14,
+          border: "1px solid rgba(255,255,255,0.06)",
+        }}>
+          <div style={{ fontSize: 28, marginBottom: 8 }}>📭</div>
+          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.6)" }}>
+            ไม่มีข่าวใน 7 วันที่ผ่านมา
+          </div>
+        </div>
+      )}
+
+      {/* News cards */}
+      {!loading && visible.map((n, i) => {
+        const info = STOCKS[n._ticker] || {};
+        const cardId = `${n.id || n.headline}-${i}`;
+        const isExpanded = expandedId === cardId;
+        const headlineText = translateOn && n.headline
+          ? (translations[n.headline] || n.headline)
+          : n.headline;
+        const summaryText = translateOn && n.summary
+          ? (translations[n.summary] || n.summary)
+          : n.summary;
+        const isHeadlinePending = translateOn && n.headline && translations[n.headline] === undefined;
+        const isSummaryPending = translateOn && n.summary && translations[n.summary] === undefined;
+        return (
+          <div
+            key={cardId}
+            onClick={() => setExpandedId(isExpanded ? null : cardId)}
+            style={{
+              cursor: "pointer",
+              background: isExpanded ? "rgba(99,102,241,0.06)" : "rgba(255,255,255,0.03)",
+              border: `1px solid ${isExpanded ? "rgba(99,102,241,0.3)" : "rgba(255,255,255,0.06)"}`,
+              borderRadius: 12, padding: 12, marginBottom: 10,
+              transition: "background 0.15s, border-color 0.15s",
+            }}
+          >
+            <div style={{
+              display: "flex", alignItems: "center", gap: 6,
+              marginBottom: 6, fontSize: 10, flexWrap: "wrap",
+            }}>
+              <span style={{
+                padding: "2px 6px", borderRadius: 5,
+                background: `${info.color || "#6366f1"}22`,
+                border: `1px solid ${info.color || "#6366f1"}55`,
+                color: info.color || "#a5b4fc", fontWeight: 700,
+              }}>
+                {info.icon} {n._ticker}
+              </span>
+              <span style={{ color: "rgba(255,255,255,0.4)" }}>·</span>
+              <span style={{ color: "rgba(255,255,255,0.5)" }}>{n.source}</span>
+              <span style={{ color: "rgba(255,255,255,0.4)" }}>·</span>
+              <span style={{ color: "rgba(255,255,255,0.5)" }}>{fmtTime(n.datetime)}</span>
+              <span style={{ marginLeft: "auto", color: "rgba(255,255,255,0.35)", fontSize: 11 }}>
+                {isExpanded ? "▲" : "▼"}
+              </span>
+            </div>
+            <div style={{
+              fontSize: 13, fontWeight: 600, color: "#fff",
+              lineHeight: 1.4, marginBottom: summaryText || isExpanded ? 6 : 0,
+              opacity: isHeadlinePending ? 0.55 : 1,
+            }}>
+              {headlineText}
+              {isHeadlinePending && <span style={{ fontSize: 9, color: "#fbbf24", marginLeft: 6 }}>กำลังแปล…</span>}
+            </div>
+            {summaryText && (
+              <div style={{
+                fontSize: 11, color: "rgba(255,255,255,0.65)",
+                lineHeight: 1.55,
+                opacity: isSummaryPending ? 0.55 : 1,
+                ...(isExpanded ? {} : {
+                  display: "-webkit-box", WebkitLineClamp: 3,
+                  WebkitBoxOrient: "vertical", overflow: "hidden",
+                }),
+              }}>
+                {summaryText}
+                {isSummaryPending && <span style={{ fontSize: 9, color: "#fbbf24", marginLeft: 6 }}>กำลังแปล…</span>}
+              </div>
+            )}
+            {isExpanded && (
+              <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                {n.image && (
+                  <img
+                    src={n.image}
+                    alt=""
+                    onError={(e) => { e.currentTarget.style.display = "none"; }}
+                    style={{
+                      width: 60, height: 60, objectFit: "cover", borderRadius: 8,
+                      flexShrink: 0,
+                    }}
+                  />
+                )}
+                <a
+                  href={n.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    flex: 1, padding: "10px 14px", textAlign: "center",
+                    background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                    color: "#fff", textDecoration: "none",
+                    borderRadius: 10, fontSize: 12, fontWeight: 700,
+                    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                  }}
+                >
+                  🔗 อ่านต้นฉบับที่ {n.source || "site"} →
+                </a>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1050,8 +1684,132 @@ function SignalBreakdown({ quant }) {
 // ========================================================
 // EXIT PLAN (เมื่อไหร่ควรขาย) + POSITION TRACKER
 // ========================================================
+// ========================================================
+// ENTRY/EXIT TIMING — รวมทุกปัจจัยให้เป็นเกรดเดียว
+// ========================================================
+function calculateEntryTiming(ticker, stock, quant, regime) {
+  if (!stock?.prices || stock.prices.length < 20 || !quant) return null;
+
+  const prices = stock.prices;
+  const P = prices[prices.length - 1];
+  const recent = prices.slice(-20);
+  const M = mean(recent);
+  const S = std(recent);
+  const high20 = Math.max(...recent);
+  const low20 = Math.min(...recent);
+
+  const z = quant.zscore || 0;
+  const verdict = quant.verdict;
+  const score = quant.score || 50;
+  const r10 = percentChange(prices, 10);
+  const r30 = percentChange(prices, 30);
+  const rsSignal = quant.signals?.find(s => s.name === "Rel Strength");
+  const rsValue = rsSignal ? parseFloat(rsSignal.value) : 0;
+
+  // Distance metrics
+  const distFromHigh = ((high20 - P) / P) * 100; // % below 20d high
+  const distFromLow = ((P - low20) / low20) * 100; // % above 20d low
+  const momRatio = r30 !== 0 ? r10 / r30 : 0; // parabolic indicator
+
+  // ENTRY SCORE (0-100)
+  let entryScore = 50;
+  const pros = [];
+  const cons = [];
+
+  // 1) Z-Score — most important for "ติดดอย"
+  if (z < -2) { entryScore += 22; pros.push({ text: `ราคาต่ำกว่า mean ${Math.abs(z).toFixed(1)}σ — ของถูก!`, weight: "high" }); }
+  else if (z < -1) { entryScore += 14; pros.push({ text: `Oversold (Z ${z.toFixed(2)}) — pullback in trend`, weight: "high" }); }
+  else if (z < -0.3) { entryScore += 6; pros.push({ text: `Z-Score ${z.toFixed(2)} — ราคาดีอยู่`, weight: "medium" }); }
+  else if (z < 0.5) { entryScore += 2; }
+  else if (z < 1) { entryScore -= 8; cons.push({ text: `Z-Score ${z.toFixed(2)} — เริ่ม overbought`, weight: "medium" }); }
+  else if (z < 1.5) { entryScore -= 16; cons.push({ text: `Z-Score ${z.toFixed(2)} — overbought ชัดเจน`, weight: "high" }); }
+  else { entryScore -= 25; cons.push({ text: `Z-Score ${z.toFixed(2)} — stretched มาก เสี่ยงติดดอย!`, weight: "high" }); }
+
+  // 2) Quant verdict
+  if (verdict === "Strong Buy") { entryScore += 15; pros.push({ text: `Quant verdict: Strong Buy (${score})`, weight: "high" }); }
+  else if (verdict === "Buy") { entryScore += 8; pros.push({ text: `Quant verdict: Buy (${score})`, weight: "medium" }); }
+  else if (verdict === "Hold") { entryScore -= 5; cons.push({ text: `Quant verdict: Hold (${score}) — ไม่มีสัญญาณชัด`, weight: "medium" }); }
+  else if (verdict === "Sell") { entryScore -= 25; cons.push({ text: `Quant verdict: Sell (${score})`, weight: "high" }); }
+  else if (verdict === "Strong Sell") { entryScore -= 40; cons.push({ text: `Quant verdict: Strong Sell (${score})`, weight: "high" }); }
+
+  // 3) Distance from 20-day high — buying the top check
+  if (distFromHigh < 1) { entryScore -= 18; cons.push({ text: `ห่าง 20-day high แค่ ${distFromHigh.toFixed(1)}% — กำลังซื้อยอด!`, weight: "high" }); }
+  else if (distFromHigh < 2.5) { entryScore -= 10; cons.push({ text: `ใกล้ 20-day high (${distFromHigh.toFixed(1)}%)`, weight: "medium" }); }
+  else if (distFromHigh > 8) { entryScore += 4; pros.push({ text: `ห่างจาก high ${distFromHigh.toFixed(1)}% — มี buffer`, weight: "low" }); }
+
+  // 4) Momentum — parabolic blow-off detector
+  if (r10 > 15 && r30 > 0 && momRatio > 0.8) {
+    entryScore -= 14; cons.push({ text: `Parabolic rally (10d +${r10.toFixed(1)}%) — climax run`, weight: "high" });
+  } else if (r10 > 0 && r30 > 0 && momRatio > 0.5 && momRatio < 0.7) {
+    entryScore += 6; pros.push({ text: `Steady uptrend (${r10.toFixed(1)}%/${r30.toFixed(1)}%)`, weight: "medium" });
+  } else if (r10 < 0 && r30 > 5) {
+    entryScore += 8; pros.push({ text: `Pullback in uptrend (10d ${r10.toFixed(1)}%, 30d +${r30.toFixed(1)}%)`, weight: "high" });
+  } else if (r10 < -5 && r30 < 0) {
+    entryScore -= 8; cons.push({ text: `Downtrend ต่อเนื่อง (${r10.toFixed(1)}%/${r30.toFixed(1)}%)`, weight: "medium" });
+  }
+
+  // 5) Relative Strength — only buy strength
+  if (rsValue > 10) { entryScore += 6; pros.push({ text: `แกร่งกว่า SPY +${rsValue.toFixed(1)}%`, weight: "medium" }); }
+  else if (rsValue < -10) { entryScore -= 8; cons.push({ text: `อ่อนกว่า SPY ${rsValue.toFixed(1)}%`, weight: "medium" }); }
+
+  // 6) Regime context
+  if (regime?.score > 80) { entryScore -= 8; cons.push({ text: `Regime overheated (${regime.score}/100) — เสี่ยง pullback ใหญ่`, weight: "medium" }); }
+  else if (regime?.score >= 50 && regime?.score <= 65) { entryScore += 3; pros.push({ text: `Regime sweet spot (${regime.score}/100)`, weight: "low" }); }
+  else if (regime?.score < 35) { entryScore -= 5; cons.push({ text: `Regime risk-off (${regime.score}/100)`, weight: "medium" }); }
+
+  // Clamp
+  entryScore = Math.max(0, Math.min(100, entryScore));
+
+  // Grade + signal
+  let grade, signal, action, color;
+  if (entryScore >= 80) { grade = "A+"; signal = "🟢 BUY NOW"; action = "เข้าได้เต็ม size — จังหวะดีมาก"; color = "#22c55e"; }
+  else if (entryScore >= 65) { grade = "A"; signal = "🟢 BUY"; action = "เข้าได้ 70-100% size"; color = "#4ade80"; }
+  else if (entryScore >= 50) { grade = "B"; signal = "🟡 BUY 50%"; action = "เข้าได้ครึ่ง size · เก็บกระสุนเผื่อย่อ"; color = "#86efac"; }
+  else if (entryScore >= 35) {
+    if (z > 0.5) { grade = "C"; signal = "🟡 WAIT FOR DIP"; action = `รอราคาย่อมาที่ mean ${fmtPrice(M, ticker)} (-${((P - M) / P * 100).toFixed(1)}%) ก่อนเข้า`; color = "#fbbf24"; }
+    else { grade = "C"; signal = "🟡 WAIT"; action = "รอสัญญาณดีกว่านี้ก่อนเข้า"; color = "#fbbf24"; }
+  }
+  else if (entryScore >= 20) { grade = "D"; signal = "🟠 AVOID"; action = "ไม่ควรเข้าตอนนี้ — สัญญาณลบเด่น"; color = "#f97316"; }
+  else { grade = "F"; signal = "🔴 DON'T BUY"; action = "ห้ามเข้า — verdict Sell + ราคายังสูง"; color = "#ef4444"; }
+
+  // Tinai (bag-holder) risk flag
+  const tinaiRisk = (
+    (verdict === "Strong Buy" || verdict === "Buy") &&
+    (z > 1 || distFromHigh < 2 || (r10 > 12 && momRatio > 0.7))
+  );
+
+  // Suggested entry zones
+  const bestEntry = M - S;            // -1σ (oversold zone)
+  const okEntryLow = M - 0.3 * S;     // mean - 0.3σ
+  const okEntryHigh = M + 0.3 * S;    // mean + 0.3σ (acceptable)
+  const stretched = M + S;            // +1σ — caution
+  const avoidAbove = M + 1.5 * S;     // +1.5σ — don't buy
+
+  // EXIT SIGNAL (ถ้ามีคนถือ — ดู urgency จาก calculateExitPlan)
+  let exitSignal, exitColor;
+  if (verdict === "Strong Sell" || z > 2) { exitSignal = "🔴 SELL NOW"; exitColor = "#ef4444"; }
+  else if (z > 1.5 || (verdict === "Sell" && distFromHigh < 3)) { exitSignal = "🟠 TAKE PARTIAL"; exitColor = "#f97316"; }
+  else if (z > 1 || verdict === "Sell") { exitSignal = "🟡 TIGHTEN STOP"; exitColor = "#fbbf24"; }
+  else if (verdict === "Hold") { exitSignal = "⏳ HOLD + TRAIL"; exitColor = "#a5b4fc"; }
+  else { exitSignal = "🟢 HOLD"; exitColor = "#4ade80"; }
+
+  return {
+    entryScore: Math.round(entryScore),
+    grade, signal, action, color,
+    pros, cons,
+    tinaiRisk,
+    currentPrice: P,
+    mean: M,
+    bestEntry, okEntryLow, okEntryHigh, stretched, avoidAbove,
+    high20, low20,
+    distFromHigh, distFromLow, momRatio,
+    z, verdict, score,
+    exitSignal, exitColor,
+  };
+}
+
 function summarizePosition(position, currentPrice) {
-  const entries = position?.entries || [];
+  const entries = Array.isArray(position) ? position : (position?.entries || []);
   if (!entries.length) return null;
   const totalQty = entries.reduce((s, e) => s + Number(e.qty), 0);
   const totalCost = entries.reduce((s, e) => s + Number(e.qty) * Number(e.price), 0);
@@ -1111,8 +1869,12 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
   }
 
   const riskOn = isCrypto || ["NVDA", "GOOGL"].includes(ticker);
+  const safeHaven = info.kind === "safe_haven";
   if (riskOn && regime?.score < 40) {
     triggers.push({ sev: "high", text: `Regime risk-off (${regime.score}/100) — เป็นลบต่อ ${ticker}` });
+  }
+  if (safeHaven && regime?.score > 65) {
+    triggers.push({ sev: "medium", text: `Regime risk-on (${regime.score}/100) — เงินไหลออกจากทอง` });
   }
 
   if (quant.verdict?.includes("Sell")) {
@@ -1213,6 +1975,249 @@ function calculateExitPlan(ticker, stock, quant, regime, position) {
     qScore, verdict: quant.verdict,
     position: pos, profitPlan,
   };
+}
+
+function EntryTimingView({ ticker, timing, hasPosition }) {
+  if (!timing) return (
+    <div style={{ padding: 20, textAlign: "center", color: "rgba(255,255,255,0.4)", fontSize: 12 }}>
+      ยังโหลดข้อมูลไม่ครบ
+    </div>
+  );
+
+  const t = timing;
+  const info = STOCKS[ticker] || {};
+
+  // Position of current price within range [low20, high20]
+  const range = t.high20 - t.low20;
+  const positionPct = range > 0 ? ((t.currentPrice - t.low20) / range) * 100 : 50;
+
+  return (
+    <div>
+      {/* Big Grade Card */}
+      <div style={{
+        background: `linear-gradient(135deg, ${t.color}25, ${t.color}05)`,
+        border: `2px solid ${t.color}55`,
+        borderRadius: 18, padding: 18, marginBottom: 14,
+        textAlign: "center",
+      }}>
+        <div style={{ fontSize: 9, color: "rgba(255,255,255,0.5)", letterSpacing: 2, marginBottom: 6 }}>
+          ENTRY TIMING GRADE
+        </div>
+        <div style={{
+          fontSize: 64, fontWeight: 900, color: t.color,
+          lineHeight: 1, marginBottom: 6,
+          fontFamily: "'Space Mono', monospace",
+        }}>
+          {t.grade}
+        </div>
+        <div style={{ fontSize: 18, fontWeight: 700, color: t.color, marginBottom: 4 }}>
+          {t.signal}
+        </div>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.7)", lineHeight: 1.5 }}>
+          {t.action}
+        </div>
+        <div style={{
+          marginTop: 10, fontSize: 10, color: "rgba(255,255,255,0.5)",
+          fontFamily: "'Space Mono', monospace",
+        }}>
+          Score: {t.entryScore}/100
+        </div>
+      </div>
+
+      {/* ติดดอย Risk warning */}
+      {t.tinaiRisk && (
+        <div style={{
+          padding: 12, marginBottom: 12, borderRadius: 12,
+          background: "rgba(245,158,11,0.12)",
+          border: "1px solid rgba(245,158,11,0.4)",
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#fbbf24", marginBottom: 4 }}>
+            ⚠️ ติดดอย Risk
+          </div>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.75)", lineHeight: 1.5 }}>
+            Verdict ดี แต่ราคาอยู่โซน overbought / ใกล้ high → เข้าตอนนี้เสี่ยงเป็น bag holder
+            <br />ควรรอ pullback มาที่ <b style={{ color: "#fff" }}>{fmtPrice(t.mean, ticker)}</b> หรือต่ำกว่า
+          </div>
+        </div>
+      )}
+
+      {/* Price Position Bar */}
+      <div style={{
+        background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.06)",
+        borderRadius: 14, padding: 14, marginBottom: 12,
+      }}>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, marginBottom: 10 }}>
+          PRICE POSITION (20-DAY RANGE)
+        </div>
+
+        {/* Bar */}
+        <div style={{ position: "relative", height: 36, marginBottom: 18 }}>
+          <div style={{
+            position: "absolute", left: 0, right: 0, top: 12, height: 12, borderRadius: 6,
+            background: "linear-gradient(90deg, rgba(74,222,128,0.4) 0%, rgba(74,222,128,0.2) 30%, rgba(251,191,36,0.2) 50%, rgba(248,113,113,0.2) 70%, rgba(248,113,113,0.4) 100%)",
+            border: "1px solid rgba(255,255,255,0.08)",
+          }} />
+          {/* Current price marker */}
+          <div style={{
+            position: "absolute",
+            left: `${Math.max(0, Math.min(100, positionPct))}%`,
+            top: 6, transform: "translateX(-50%)",
+            width: 4, height: 24,
+            background: info.color || "#fff",
+            borderRadius: 2,
+            boxShadow: `0 0 8px ${info.color || "#fff"}`,
+          }} />
+          <div style={{
+            position: "absolute",
+            left: `${Math.max(0, Math.min(100, positionPct))}%`,
+            top: -2, transform: "translateX(-50%)",
+            fontSize: 9, color: info.color || "#fff", fontWeight: 700,
+            fontFamily: "'Space Mono', monospace",
+            whiteSpace: "nowrap",
+          }}>
+            ▼ NOW
+          </div>
+        </div>
+
+        {/* Labels */}
+        <div style={{
+          display: "flex", justifyContent: "space-between",
+          fontSize: 10, fontFamily: "'Space Mono', monospace",
+        }}>
+          <span style={{ color: "#4ade80" }}>
+            <div style={{ fontSize: 8, opacity: 0.6 }}>20D LOW</div>
+            <div>{fmtPrice(t.low20, ticker)}</div>
+          </span>
+          <span style={{ color: "rgba(255,255,255,0.7)", textAlign: "center" }}>
+            <div style={{ fontSize: 8, opacity: 0.6 }}>MEAN</div>
+            <div>{fmtPrice(t.mean, ticker)}</div>
+          </span>
+          <span style={{ color: "#f87171", textAlign: "right" }}>
+            <div style={{ fontSize: 8, opacity: 0.6 }}>20D HIGH</div>
+            <div>{fmtPrice(t.high20, ticker)}</div>
+          </span>
+        </div>
+      </div>
+
+      {/* Suggested Entry Zones */}
+      <div style={{
+        background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.06)",
+        borderRadius: 14, padding: 14, marginBottom: 12,
+      }}>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, marginBottom: 10 }}>
+          SUGGESTED ENTRY ZONES
+        </div>
+
+        {[
+          { label: "🟢 BEST ENTRY", desc: "ราคาต่ำกว่า mean -1σ", price: t.bestEntry, color: "#22c55e", highlight: t.currentPrice <= t.bestEntry },
+          { label: "🟢 OK ZONE", desc: "ใกล้ mean ±0.3σ", priceRange: [t.okEntryLow, t.okEntryHigh], color: "#86efac", highlight: t.currentPrice >= t.okEntryLow && t.currentPrice <= t.okEntryHigh },
+          { label: "🟡 STRETCHED", desc: "เข้าได้แต่ size เล็ก (+1σ)", price: t.stretched, color: "#fbbf24", highlight: t.currentPrice >= t.okEntryHigh && t.currentPrice <= t.stretched },
+          { label: "🔴 AVOID ABOVE", desc: "อย่าเข้าเหนือ +1.5σ", price: t.avoidAbove, color: "#ef4444", highlight: t.currentPrice >= t.stretched },
+        ].map(zone => (
+          <div key={zone.label} style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "8px 10px", marginBottom: 4, borderRadius: 8,
+            background: zone.highlight ? `${zone.color}18` : "transparent",
+            border: `1px solid ${zone.highlight ? `${zone.color}55` : "rgba(255,255,255,0.04)"}`,
+          }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: zone.color }}>{zone.label}</div>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.5)", marginTop: 1 }}>{zone.desc}</div>
+            </div>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: "#fff",
+              fontFamily: "'Space Mono', monospace",
+            }}>
+              {zone.priceRange
+                ? `${fmtPrice(zone.priceRange[0], ticker)}–${fmtPrice(zone.priceRange[1], ticker)}`
+                : fmtPrice(zone.price, ticker)}
+            </div>
+          </div>
+        ))}
+
+        <div style={{
+          marginTop: 8, padding: "6px 10px", borderRadius: 8,
+          background: "rgba(99,102,241,0.1)",
+          fontSize: 10.5, color: "rgba(255,255,255,0.7)",
+          fontFamily: "'Space Mono', monospace", textAlign: "center",
+        }}>
+          ราคาปัจจุบัน: <b style={{ color: info.color || "#fff" }}>{fmtPrice(t.currentPrice, ticker)}</b>
+        </div>
+      </div>
+
+      {/* Pros & Cons */}
+      {(t.pros.length > 0 || t.cons.length > 0) && (
+        <div style={{
+          display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12,
+        }}>
+          <div style={{
+            background: "rgba(74,222,128,0.06)",
+            border: "1px solid rgba(74,222,128,0.2)",
+            borderRadius: 12, padding: 10,
+          }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#4ade80", marginBottom: 6 }}>
+              ✅ ข้อดี ({t.pros.length})
+            </div>
+            {t.pros.length === 0 && (
+              <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)" }}>—</div>
+            )}
+            {t.pros.map((p, i) => (
+              <div key={i} style={{
+                fontSize: 10, color: "rgba(255,255,255,0.75)",
+                lineHeight: 1.4, marginBottom: 4,
+                opacity: p.weight === "high" ? 1 : p.weight === "medium" ? 0.85 : 0.65,
+              }}>
+                • {p.text}
+              </div>
+            ))}
+          </div>
+
+          <div style={{
+            background: "rgba(248,113,113,0.06)",
+            border: "1px solid rgba(248,113,113,0.2)",
+            borderRadius: 12, padding: 10,
+          }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#f87171", marginBottom: 6 }}>
+              ⚠️ ข้อเสีย ({t.cons.length})
+            </div>
+            {t.cons.length === 0 && (
+              <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)" }}>—</div>
+            )}
+            {t.cons.map((c, i) => (
+              <div key={i} style={{
+                fontSize: 10, color: "rgba(255,255,255,0.75)",
+                lineHeight: 1.4, marginBottom: 4,
+                opacity: c.weight === "high" ? 1 : c.weight === "medium" ? 0.85 : 0.65,
+              }}>
+                • {c.text}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Exit Signal (only if user has position) */}
+      {hasPosition && (
+        <div style={{
+          background: `${t.exitColor}10`,
+          border: `1px solid ${t.exitColor}40`,
+          borderRadius: 14, padding: 14,
+        }}>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", letterSpacing: 1, marginBottom: 6 }}>
+            ⏰ EXIT TIMING (มี position แล้ว)
+          </div>
+          <div style={{ fontSize: 16, fontWeight: 800, color: t.exitColor, marginBottom: 4 }}>
+            {t.exitSignal}
+          </div>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.55)" }}>
+            ดูแผน TP/SL ละเอียดที่ tab 🚪 Exit
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function PositionForm({ ticker, onAdd }) {
@@ -1453,92 +2458,16 @@ export default function StockQuantL3() {
   const [aiLoading, setAiLoading] = useState(false);
   const [tab, setTab] = useState("signals");
   const [positions, setPositions] = useState({});
-  const [alerts, setAlerts] = useState(DEFAULT_ALERTS);
-  const [notifyPerm, setNotifyPerm] = useState(
-    canNotify() ? Notification.permission : "unsupported"
-  );
-  const [toasts, setToasts] = useState([]);
-  const prevQuantsRef = useRef({});
+  const [view, setView] = useState("quant");
 
-  // Load API key + positions + alert prefs on mount
+  // Load API key + positions on mount
   useEffect(() => {
     loadApiKey().then(k => {
       setApiKey(k);
       setKeyLoaded(true);
     });
     loadPositions().then(setPositions);
-    loadAlertSettings().then(setAlerts);
   }, []);
-
-  function pushToast(t) {
-    const id = Date.now() + Math.random();
-    setToasts(prev => [...prev, { id, ...t }]);
-    setTimeout(() => {
-      setToasts(prev => prev.filter(x => x.id !== id));
-    }, 8000);
-  }
-
-  function updateAlerts(patch) {
-    setAlerts(prev => {
-      const next = { ...prev, ...patch };
-      saveAlertSettings(next);
-      return next;
-    });
-  }
-
-  // Detect verdict / z-score transitions and fire alerts
-  useEffect(() => {
-    if (!alerts.enabled) { prevQuantsRef.current = quants; return; }
-    const prev = prevQuantsRef.current || {};
-    const fired = [];
-    Object.keys(quants).forEach(t => {
-      const cur = quants[t];
-      const old = prev[t];
-      if (!cur) return;
-      const info = STOCKS[t] || {};
-      const tName = `${info.icon || ""} ${t}`;
-
-      // Verdict transitions to Strong Buy / Strong Sell
-      if (alerts.notifyExtreme && old && old.verdict !== cur.verdict) {
-        if (cur.verdict === "Strong Buy" && old.verdict !== "Strong Buy") {
-          fired.push({ kind: "buy", title: `🚀 STRONG BUY · ${t}`,
-            body: `${info.name || t} score ${cur.score}/100 (z=${cur.zscore.toFixed(2)})` });
-        } else if (cur.verdict === "Strong Sell" && old.verdict !== "Strong Sell") {
-          fired.push({ kind: "sell", title: `⚠️ STRONG SELL · ${t}`,
-            body: `${info.name || t} score ${cur.score}/100 (z=${cur.zscore.toFixed(2)})` });
-        }
-      }
-
-      // Z-score extreme crossings
-      if (alerts.notifyZ && old && cur.zscore != null && old.zscore != null) {
-        const oZ = old.zscore, nZ = cur.zscore;
-        if (oZ > -2 && nZ <= -2) {
-          fired.push({ kind: "buy", title: `🟢 OVERSOLD · ${t}`,
-            body: `z-score = ${nZ.toFixed(2)} · เด้งกลับมีโอกาสสูง` });
-        } else if (oZ < 2 && nZ >= 2) {
-          fired.push({ kind: "sell", title: `🔴 OVERBOUGHT · ${t}`,
-            body: `z-score = +${nZ.toFixed(2)} · ระวังย่อพักฐาน` });
-        }
-      }
-    });
-
-    if (fired.length) {
-      fired.forEach(f => {
-        pushToast(f);
-        fireBrowserNotification(f.title, f.body);
-      });
-      if (alerts.sound) beep(fired[0].kind);
-    }
-    prevQuantsRef.current = quants;
-  }, [quants]);
-
-  // Auto-refresh on interval
-  useEffect(() => {
-    if (!apiKey || !alerts.enabled) return;
-    const ms = Math.max(1, alerts.refreshMin) * 60_000;
-    const id = setInterval(() => { loadAll(); }, ms);
-    return () => clearInterval(id);
-  }, [apiKey, alerts.enabled, alerts.refreshMin]);
 
   function addEntry(ticker, entry) {
     setPositions(prev => {
@@ -1703,8 +2632,6 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         @keyframes pulseRed { 0%,100%{opacity:1} 50%{opacity:0.5} }
       `}</style>
 
-      <ToastStack toasts={toasts} onDismiss={(id) => setToasts(p => p.filter(t => t.id !== id))} />
-
       <div style={{ maxWidth: 390, margin: "0 auto", minHeight: "100vh", paddingBottom: 100 }}>
 
         {/* Status bar */}
@@ -1738,13 +2665,6 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
               }} />
               FINNHUB · REAL-TIME
               {lastUpdate && ` · ${lastUpdate.toLocaleTimeString("th-TH")}`}
-              {alerts.enabled && (
-                <span style={{
-                  marginLeft: 6, padding: "1px 6px", borderRadius: 6,
-                  background: "rgba(74,222,128,0.15)",
-                  color: "#4ade80", fontSize: 9, fontWeight: 700,
-                }}>🔔 {alerts.refreshMin}m</span>
-              )}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
@@ -1786,107 +2706,10 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
               border: "1px solid rgba(248,113,113,0.3)",
               color: "#f87171", fontSize: 11, cursor: "pointer",
             }}>🗑️ ลบ API Key</button>
-
-            {/* Alert settings */}
-            <div style={{
-              marginTop: 14, paddingTop: 14,
-              borderTop: "1px solid rgba(255,255,255,0.06)",
-            }}>
-              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginBottom: 10, fontWeight: 700 }}>
-                🔔 การแจ้งเตือน
-              </div>
-
-              <AlertToggle
-                label="เปิดใช้งาน auto-refresh + alerts"
-                checked={alerts.enabled}
-                onChange={v => updateAlerts({ enabled: v })}
-              />
-              <AlertToggle
-                label="แจ้งเมื่อเป็น Strong Buy / Strong Sell"
-                checked={alerts.notifyExtreme}
-                onChange={v => updateAlerts({ notifyExtreme: v })}
-              />
-              <AlertToggle
-                label="แจ้งเมื่อ z-score ทะลุ ±2 (oversold/overbought)"
-                checked={alerts.notifyZ}
-                onChange={v => updateAlerts({ notifyZ: v })}
-              />
-              <AlertToggle
-                label="🔊 เสียงเตือน"
-                checked={alerts.sound}
-                onChange={v => updateAlerts({ sound: v })}
-              />
-
-              <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "10px 0 6px" }}>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.7)" }}>เช็คทุก</span>
-                <select
-                  value={alerts.refreshMin}
-                  onChange={e => updateAlerts({ refreshMin: Number(e.target.value) })}
-                  style={{
-                    background: "rgba(255,255,255,0.06)",
-                    border: "1px solid rgba(255,255,255,0.12)",
-                    color: "#fff", padding: "5px 8px", borderRadius: 8,
-                    fontSize: 11,
-                  }}
-                >
-                  <option value={1}>1 นาที</option>
-                  <option value={3}>3 นาที</option>
-                  <option value={5}>5 นาที</option>
-                  <option value={10}>10 นาที</option>
-                  <option value={15}>15 นาที</option>
-                  <option value={30}>30 นาที</option>
-                </select>
-              </div>
-
-              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                <button
-                  onClick={async () => {
-                    const p = await requestNotifyPermission();
-                    setNotifyPerm(p);
-                    if (p === "granted") {
-                      fireBrowserNotification("✅ เปิดแจ้งเตือนสำเร็จ", "Quant L3 จะเตือนเมื่อมีสัญญาณ extreme");
-                    }
-                  }}
-                  style={{
-                    flex: 1, padding: "8px 12px", borderRadius: 10,
-                    background: notifyPerm === "granted" ? "rgba(74,222,128,0.15)" : "rgba(99,102,241,0.18)",
-                    border: `1px solid ${notifyPerm === "granted" ? "rgba(74,222,128,0.35)" : "rgba(99,102,241,0.4)"}`,
-                    color: notifyPerm === "granted" ? "#4ade80" : "#a5b4fc",
-                    fontSize: 10.5, cursor: "pointer", fontWeight: 600,
-                  }}
-                >
-                  {notifyPerm === "granted" ? "✅ Browser notify ON"
-                    : notifyPerm === "denied" ? "🚫 ถูกบล็อก (ตั้งค่าใน Safari)"
-                    : notifyPerm === "unsupported" ? "❌ Browser ไม่รองรับ"
-                    : "🔔 ขออนุญาตแจ้งเตือน"}
-                </button>
-                <button
-                  onClick={() => {
-                    pushToast({ kind: "buy", title: "🧪 ทดสอบเตือน", body: "ถ้าเห็นข้อความนี้แปลว่าใช้งานได้" });
-                    if (alerts.sound) beep("buy");
-                    fireBrowserNotification("🧪 ทดสอบเตือน", "Quant L3 alert test");
-                  }}
-                  style={{
-                    padding: "8px 12px", borderRadius: 10,
-                    background: "rgba(255,255,255,0.06)",
-                    border: "1px solid rgba(255,255,255,0.12)",
-                    color: "#fff", fontSize: 10.5, cursor: "pointer",
-                  }}
-                >🧪 ทดสอบ</button>
-              </div>
-
-              <div style={{
-                marginTop: 10, padding: 8, borderRadius: 8,
-                background: "rgba(245,158,11,0.06)",
-                border: "1px solid rgba(245,158,11,0.18)",
-                fontSize: 10, color: "rgba(255,255,255,0.55)", lineHeight: 1.5,
-              }}>
-                💡 บน iPhone: notification ผุดได้เฉพาะตอนเปิดแอปไว้
-                หรือ "เพิ่มลง Home Screen" (PWA) แล้วเปิดสแตนด์อโลน
-              </div>
-            </div>
           </div>
         )}
+
+        {view === "quant" && <>
 
         {/* Regime Dial */}
         <div style={{ padding: "16px 20px 0" }}>
@@ -1929,7 +2752,8 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
           padding: 4, gap: 2,
         }}>
           {[
-            { k: "signals", label: "🎯 Signals" },
+            { k: "signals", label: "🎯 Sig" },
+            { k: "timing", label: "⏰ จังหวะ" },
             { k: "exit", label: "🚪 Exit" },
             { k: "correlation", label: "🔗 Corr" },
             { k: "zscore", label: "📊 Z" },
@@ -1949,6 +2773,13 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         {/* Tab Content */}
         <div style={{ padding: "12px 20px 0" }}>
           {tab === "signals" && mainQuant && <SignalBreakdown quant={mainQuant} />}
+          {tab === "timing" && mainQuant && mainData && (
+            <EntryTimingView
+              ticker={activeStock}
+              timing={calculateEntryTiming(activeStock, mainData, mainQuant, regime)}
+              hasPosition={Array.isArray(positions[activeStock]) && positions[activeStock].length > 0}
+            />
+          )}
           {tab === "exit" && mainQuant && mainData && (
             <ExitPlan
               ticker={activeStock}
@@ -2128,6 +2959,33 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
           </div>
         )}
 
+        </>}
+
+        {view === "pairs" && (
+          <div style={{ padding: "16px 20px 0" }}>
+            <PairsView allData={allData} />
+          </div>
+        )}
+
+        {view === "news" && (
+          <div style={{ padding: "16px 20px 0" }}>
+            <NewsView apiKey={apiKey} />
+          </div>
+        )}
+
+        {view === "portfolio" && (
+          <div style={{ padding: "16px 20px 0" }}>
+            <PortfolioView
+              positions={positions}
+              allData={allData}
+              quants={quants}
+              regime={regime}
+              onSelect={(t) => { setActiveStock(t); setView("quant"); setTab("exit"); }}
+              onRemoveEntry={removeEntry}
+            />
+          </div>
+        )}
+
         {/* Disclaimer */}
         <div style={{
           margin: "16px 20px 0", padding: "10px 14px",
@@ -2146,20 +3004,25 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
           padding: "12px 0 28px", display: "flex", justifyContent: "space-around",
         }}>
           {[
-            { icon: "📊", label: "Quant" },
-            { icon: "🔗", label: "Pairs" },
-            { icon: "⭐", label: "พอร์ต" },
-            { icon: "⚙️", label: "ตั้งค่า" },
-          ].map(({ icon, label }, i) => (
-            <button key={i} style={{
-              background: "none", border: "none", cursor: "pointer",
-              display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
-              opacity: i === 0 ? 1 : 0.35,
-            }}>
-              <span style={{ fontSize: 22 }}>{icon}</span>
-              <span style={{ fontSize: 10, color: i === 0 ? "#6366f1" : "rgba(255,255,255,0.5)" }}>{label}</span>
-            </button>
-          ))}
+            { key: "quant", icon: "📊", label: "Quant", action: () => { setView("quant"); setShowSettings(false); } },
+            { key: "pairs", icon: "🔗", label: "Pairs", action: () => { setView("pairs"); setShowSettings(false); } },
+            { key: "news", icon: "📰", label: "ข่าว", action: () => { setView("news"); setShowSettings(false); } },
+            { key: "portfolio", icon: "⭐", label: "พอร์ต", action: () => { setView("portfolio"); setShowSettings(false); } },
+            { key: "settings", icon: "⚙️", label: "ตั้งค่า", action: () => { setShowSettings(s => !s); } },
+          ].map(({ key, icon, label, action }) => {
+            const active = key === "settings" ? showSettings : view === key && !showSettings;
+            return (
+              <button key={key} onClick={action} style={{
+                background: "none", border: "none", cursor: "pointer",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+                opacity: active ? 1 : 0.5,
+                transition: "opacity 0.15s",
+              }}>
+                <span style={{ fontSize: 22 }}>{icon}</span>
+                <span style={{ fontSize: 10, color: active ? "#6366f1" : "rgba(255,255,255,0.5)", fontWeight: active ? 700 : 400 }}>{label}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
     </div>
