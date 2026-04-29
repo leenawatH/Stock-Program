@@ -43,6 +43,13 @@ export default defineConfig({
         rewrite: (p) => p.replace(/^\/api\/translate/, ""),
         headers: { "User-Agent": BROWSER_UA },
       },
+      "/api/hsh": {
+        target: "https://apicheckprice.huasengheng.com",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (p) => p.replace(/^\/api\/hsh/, ""),
+        headers: { "User-Agent": BROWSER_UA },
+      },
     },
   },
 });

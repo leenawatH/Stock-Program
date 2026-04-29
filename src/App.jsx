@@ -8,14 +8,13 @@ const STOCKS = {
   NVDA:       { name: "NVIDIA",          color: "#76b900", icon: "⚡", kind: "stock" },
   GOOGL:      { name: "Alphabet",        color: "#4285f4", icon: "🔍", kind: "stock" },
   BAC:        { name: "Bank of America", color: "#e31837", icon: "🏦", kind: "stock" },
-  GLD:        { name: "Gold ETF",        color: "#ffd700", icon: "🥇", kind: "safe_haven" },
+  "GC=F":     { name: "Gold Spot",       color: "#ffd700", icon: "🥇", kind: "safe_haven", finnhub: null, short: "GOLD" },
   "BTC-USD":  { name: "Bitcoin",         color: "#f7931a", icon: "₿", kind: "crypto", finnhub: "BINANCE:BTCUSDT" },
   "DOGE-USD": { name: "Dogecoin",        color: "#c2a633", icon: "🐕", kind: "crypto", finnhub: "BINANCE:DOGEUSDT" },
 };
 
 const COMPARE_ASSETS = {
   SPY:        { name: "S&P 500", short: "SPY",  color: "#a855f7", icon: "📈" },
-  "GC=F":     { name: "Gold",    short: "GOLD", color: "#ffd700", icon: "🥇", finnhub: null },
   "DX-Y.NYB": { name: "Dollar",  short: "DXY",  color: "#22c55e", icon: "💵", finnhub: null },
 };
 
@@ -100,6 +99,49 @@ async function fetchCryptoNews(apiKey) {
     const data = await res.json();
     return Array.isArray(data) ? data : [];
   } catch { return []; }
+}
+
+async function fetchGeneralNews(apiKey) {
+  const url = `/api/finnhub/api/v1/news?category=general&token=${apiKey}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+// Hua Seng Heng (ฮั่วเซ่งเฮง) — ราคาทองคำในประเทศ real-time
+// proxy → apicheckprice.huasengheng.com/api/values/getprice
+// คืน 3 record: HSH (ราคา HSH realtime), REF (อ้างอิงสมาคม), JEWEL (รูปพรรณ)
+async function fetchThaiGoldPrice() {
+  try {
+    const res = await fetch("/api/hsh/api/values/getprice");
+    if (!res.ok) return null;
+    const arr = await res.json();
+    if (!Array.isArray(arr)) return null;
+    const parse = (s) => {
+      if (s == null) return null;
+      const n = parseFloat(String(s).replace(/,/g, ""));
+      return Number.isFinite(n) ? n : null;
+    };
+    const pick = (type) => arr.find(x => x.GoldType === type) || null;
+    const hsh = pick("HSH");
+    const ref = pick("REF");
+    const jw  = pick("JEWEL");
+    const map = (x) => x ? {
+      buy:        parse(x.Buy),
+      sell:       parse(x.Sell),
+      buyChange:  parse(x.BuyChange),
+      sellChange: parse(x.SellChange),
+      time:       x.TimeUpdate || null,
+      timeStr:    x.StrTimeUpdate || null,
+    } : null;
+    return {
+      hsh:   map(hsh),   // ราคาฮั่วเซ่งเฮง real-time (ใช้เป็นหลัก)
+      ref:   map(ref),   // ราคาสมาคมค้าทองคำ (อ้างอิง)
+      jewel: map(jw),    // ทองรูปพรรณ
+    };
+  } catch { return null; }
 }
 
 // Google Translate (free, no API key) — proxied via /api/translate
@@ -202,12 +244,12 @@ async function fetchAsset(symbol, apiKey) {
     // Fallback: Finnhub binance
   }
 
-  const useFinnhub = meta.finnhub !== null && (meta.kind === "stock" || meta.kind === "crypto" || symbol === "SPY");
+  const useFinnhub = meta.finnhub !== null && (meta.kind === "stock" || meta.kind === "crypto" || meta.kind === "safe_haven" || symbol === "SPY");
   if (useFinnhub) {
     const finnhubSym = meta.finnhub || symbol;
     const candles = await fetchFinnhubCandles(finnhubSym, apiKey);
     if (candles) {
-      if (meta.kind === "stock" || symbol === "SPY") {
+      if (meta.kind === "stock" || meta.kind === "safe_haven" || symbol === "SPY") {
         const quote = await fetchFinnhubQuote(finnhubSym, apiKey);
         if (quote?.c) {
           candles.current = quote.c;
@@ -876,6 +918,7 @@ function NewsView({ apiKey }) {
         const result = {};
         const stockTickers = Object.keys(STOCKS).filter(t => STOCKS[t].kind === "stock");
         const cryptoTickers = Object.keys(STOCKS).filter(t => STOCKS[t].kind === "crypto");
+        const safeHavens   = Object.keys(STOCKS).filter(t => STOCKS[t].kind === "safe_haven");
 
         const stockNews = await Promise.all(stockTickers.map(t => fetchCompanyNews(t, apiKey, 7)));
         stockTickers.forEach((t, i) => { result[t] = (stockNews[i] || []).slice(0, 12); });
@@ -890,6 +933,16 @@ function NewsView({ apiKey }) {
                 const text = `${n.headline || ""} ${n.summary || ""}`.toLowerCase();
                 return text.includes(name) || text.includes(sym);
               })
+              .slice(0, 12);
+          }
+        }
+
+        if (safeHavens.length) {
+          const generalFeed = await fetchGeneralNews(apiKey);
+          const goldRx = /\b(gold|xau|bullion|ทอง|ออนซ์)\b/i;
+          for (const t of safeHavens) {
+            result[t] = generalFeed
+              .filter(n => goldRx.test(`${n.headline || ""} ${n.summary || ""}`))
               .slice(0, 12);
           }
         }
@@ -1278,7 +1331,7 @@ function APIKeySetup({ onSave }) {
   );
 }
 
-function StockCard({ ticker, data, quant, loading, onSelect, isActive }) {
+function StockCard({ ticker, data, quant, timing, thaiGold, loading, onSelect, isActive }) {
   const info = STOCKS[ticker];
   const change = data ? ((data.current - data.previousClose) / data.previousClose) * 100 : 0;
   const isUp = change >= 0;
@@ -1306,7 +1359,7 @@ function StockCard({ ticker, data, quant, loading, onSelect, isActive }) {
         border: `1px solid ${info.color}44`,
       }}>{info.icon}</div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
           <span style={{ color: "#fff", fontWeight: 700, fontSize: 15,
             fontFamily: "'Space Mono', monospace" }}>{ticker}</span>
           {quant && (
@@ -1315,14 +1368,47 @@ function StockCard({ ticker, data, quant, loading, onSelect, isActive }) {
               background: `${verdictColor}22`, color: verdictColor, fontWeight: 700,
             }}>{quant.verdict}</span>
           )}
+          {timing && (
+            <span style={{
+              fontSize: 9, padding: "2px 6px", borderRadius: 6,
+              background: `${timing.color}22`,
+              border: `1px solid ${timing.color}55`,
+              color: timing.color, fontWeight: 800,
+              fontFamily: "'Space Mono', monospace",
+              letterSpacing: 0.3,
+            }}>
+              {timing.grade} · {(timing.signal || "").replace(/^\S+\s*/, "")}
+            </span>
+          )}
+          {timing?.tinaiRisk && (
+            <span style={{
+              fontSize: 8, padding: "2px 5px", borderRadius: 5,
+              background: "rgba(245,158,11,0.18)",
+              border: "1px solid rgba(245,158,11,0.4)",
+              color: "#fbbf24", fontWeight: 800, letterSpacing: 0.5,
+              fontFamily: "'Space Mono', monospace",
+            }}>RISK</span>
+          )}
         </div>
         <div style={{ color: "rgba(255,255,255,0.45)", fontSize: 10, marginTop: 1 }}>{info.name}</div>
       </div>
       {loading ? <LoadingDots color={info.color} /> : data && (
         <div style={{ textAlign: "right" }}>
-          <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 14, fontWeight: 700, color: "#fff" }}>
-            {fmtPrice(data.current, ticker)}
-          </div>
+          {ticker === "GC=F" && thaiGold?.hsh?.sell ? (
+            <>
+              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 14, fontWeight: 700, color: "#ffd700" }}>
+                ฿{thaiGold.hsh.sell.toLocaleString()}
+              </div>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.5)", marginTop: 2,
+                fontFamily: "'Space Mono', monospace" }}>
+                {fmtPrice(data.current, ticker)}/oz
+              </div>
+            </>
+          ) : (
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 14, fontWeight: 700, color: "#fff" }}>
+              {fmtPrice(data.current, ticker)}
+            </div>
+          )}
           <div style={{ fontSize: 10, fontFamily: "'Space Mono', monospace",
             color: isUp ? "#4ade80" : "#f87171" }}>
             {isUp ? "▲" : "▼"} {Math.abs(change).toFixed(2)}%
@@ -1336,6 +1422,89 @@ function StockCard({ ticker, data, quant, loading, onSelect, isActive }) {
         </div>
       )}
     </button>
+  );
+}
+
+function ThaiGoldPanel({ data }) {
+  if (!data) return null;
+  const fmtChange = (n) => {
+    if (n == null) return null;
+    const sign = n > 0 ? "+" : "";
+    return `${sign}${n.toLocaleString()}`;
+  };
+  const Row = ({ label, sub, row, accent, highlight }) => {
+    if (!row) return null;
+    const spread = (row.sell != null && row.buy != null) ? row.sell - row.buy : null;
+    const chgColor = row.sellChange > 0 ? "#4ade80" : row.sellChange < 0 ? "#f87171" : "rgba(255,255,255,0.45)";
+    return (
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "1.1fr 1fr 1fr",
+        gap: 10, padding: "10px 12px",
+        background: highlight ? "rgba(255,215,0,0.08)" : "rgba(255,255,255,0.03)",
+        border: `1px solid ${accent}${highlight ? "66" : "33"}`,
+        borderRadius: 12, marginTop: 6,
+      }}>
+        <div>
+          <div style={{ fontSize: 10, color: highlight ? accent : "rgba(255,255,255,0.7)",
+            letterSpacing: 0.5, fontWeight: highlight ? 800 : 600 }}>
+            {label}
+          </div>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>{sub}</div>
+          {spread != null && (
+            <div style={{ fontSize: 9, color: accent, marginTop: 2, fontWeight: 700,
+              fontFamily: "'Space Mono', monospace" }}>
+              spread {spread.toLocaleString()}
+            </div>
+          )}
+        </div>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>รับซื้อ</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#fff",
+            fontFamily: "'Space Mono', monospace", marginTop: 2 }}>
+            {row.buy != null ? row.buy.toLocaleString() : "—"}
+          </div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>ขายออก</div>
+          <div style={{ fontSize: 14, fontWeight: 800, color: accent,
+            fontFamily: "'Space Mono', monospace", marginTop: 2 }}>
+            {row.sell != null ? row.sell.toLocaleString() : "—"}
+          </div>
+          {row.sellChange != null && (
+            <div style={{ fontSize: 9, color: chgColor, marginTop: 2, fontWeight: 700,
+              fontFamily: "'Space Mono', monospace" }}>
+              {row.sellChange > 0 ? "▲" : row.sellChange < 0 ? "▼" : "·"} {fmtChange(row.sellChange)}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+  const head = data.hsh?.timeStr || data.ref?.timeStr || "";
+  return (
+    <div style={{
+      padding: "12px 14px",
+      background: "linear-gradient(135deg, rgba(255,215,0,0.10), rgba(0,0,0,0.4))",
+      border: "1px solid rgba(255,215,0,0.35)",
+      borderRadius: 18,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
+        <div style={{ fontSize: 11, color: "#ffd700", letterSpacing: 1, fontWeight: 700 }}>
+          🥇 ราคาทอง · ฮั่วเซ่งเฮง
+        </div>
+        <div style={{ fontSize: 9, color: "rgba(255,255,255,0.45)",
+          fontFamily: "'Space Mono', monospace" }}>
+          {head}
+        </div>
+      </div>
+      <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>
+        บาท / บาทน้ำหนัก (1 บาท = 15.244 ก.) · ทอง 96.5%
+      </div>
+      <Row label="ทองแท่ง HSH" sub="ฮั่วเซ่งเฮง real-time" row={data.hsh} accent="#ffd700" highlight />
+      <Row label="ทองแท่ง REF" sub="อ้างอิงสมาคมค้าทองคำ"  row={data.ref} accent="#fbbf24" />
+      <Row label="ทองรูปพรรณ"  sub="JEWEL"                 row={data.jewel} accent="#f59e0b" />
+    </div>
   );
 }
 
@@ -1464,14 +1633,14 @@ function CorrelationMatrix({ allData }) {
   );
 }
 
-function QuantGauge({ score, verdict }) {
+function QuantGauge({ score, verdict, timing, onTimingClick }) {
   const angle = (score / 100) * 180 - 90;
   const color = score >= 75 ? "#22c55e" : score >= 60 ? "#4ade80" :
                 score >= 45 ? "#fbbf24" : score >= 30 ? "#f87171" : "#dc2626";
 
   return (
     <div style={{
-      padding: "16px 16px 10px",
+      padding: "16px 16px 12px",
       background: `linear-gradient(135deg, ${color}18, rgba(0,0,0,0.4))`,
       border: `1px solid ${color}44`,
       borderRadius: 18,
@@ -1503,7 +1672,59 @@ function QuantGauge({ score, verdict }) {
         fontSize: 32, fontWeight: 800, color, marginTop: -6,
         fontFamily: "'Space Mono', monospace",
       }}>{score}</div>
-      <div style={{ fontSize: 14, fontWeight: 700, color, letterSpacing: 0.5 }}>{verdict}</div>
+
+      {/* Verdict + Entry Timing side-by-side */}
+      <div style={{
+        display: "flex", gap: 8, marginTop: 8, alignItems: "stretch",
+      }}>
+        <div style={{
+          flex: 1, padding: "8px 6px", borderRadius: 10,
+          background: `${color}1f`,
+          border: `1px solid ${color}55`,
+        }}>
+          <div style={{ fontSize: 8, color: "rgba(255,255,255,0.55)", letterSpacing: 1, marginBottom: 2 }}>
+            VERDICT
+          </div>
+          <div style={{ fontSize: 13, fontWeight: 800, color }}>{verdict}</div>
+        </div>
+
+        {timing && (
+          <button
+            onClick={onTimingClick}
+            style={{
+              flex: 1, padding: "8px 6px", borderRadius: 10,
+              background: `${timing.color}1f`,
+              border: `1px solid ${timing.color}55`,
+              cursor: onTimingClick ? "pointer" : "default",
+              textAlign: "center",
+              fontFamily: "inherit",
+            }}
+          >
+            <div style={{ fontSize: 8, color: "rgba(255,255,255,0.55)", letterSpacing: 1, marginBottom: 2 }}>
+              ENTRY · {timing.grade}
+            </div>
+            <div style={{ fontSize: 12, fontWeight: 800, color: timing.color, lineHeight: 1.2 }}>
+              {timing.signal}
+            </div>
+          </button>
+        )}
+      </div>
+
+      {/* ติดดอย warning */}
+      {timing?.tinaiRisk && (
+        <div
+          onClick={onTimingClick}
+          style={{
+            marginTop: 8, padding: "5px 10px", borderRadius: 8,
+            background: "rgba(245,158,11,0.12)",
+            border: "1px solid rgba(245,158,11,0.35)",
+            fontSize: 10, color: "#fbbf24",
+            cursor: onTimingClick ? "pointer" : "default",
+          }}
+        >
+          ⚠️ ติดดอย risk — verdict ดี แต่ราคา stretched
+        </div>
+      )}
     </div>
   );
 }
@@ -2459,6 +2680,7 @@ export default function StockQuantL3() {
   const [tab, setTab] = useState("signals");
   const [positions, setPositions] = useState({});
   const [view, setView] = useState("quant");
+  const [thaiGold, setThaiGold] = useState(null);
 
   // Load API key + positions on mount
   useEffect(() => {
@@ -2467,6 +2689,15 @@ export default function StockQuantL3() {
       setKeyLoaded(true);
     });
     loadPositions().then(setPositions);
+  }, []);
+
+  // Fetch Thai Gold price on mount + refresh every 10 min
+  useEffect(() => {
+    fetchThaiGoldPrice().then(r => r && setThaiGold(r));
+    const id = setInterval(() => {
+      fetchThaiGoldPrice().then(r => r && setThaiGold(r));
+    }, 600000);
+    return () => clearInterval(id);
   }, []);
 
   function addEntry(ticker, entry) {
@@ -2725,6 +2956,10 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
           {Object.keys(STOCKS).map(ticker => (
             <StockCard key={ticker} ticker={ticker}
               data={allData[ticker]} quant={quants[ticker]}
+              timing={allData[ticker] && quants[ticker] && regime
+                ? calculateEntryTiming(ticker, allData[ticker], quants[ticker], regime)
+                : null}
+              thaiGold={thaiGold}
               loading={loading[ticker]}
               onSelect={setActiveStock} isActive={activeStock === ticker}
             />
@@ -2734,7 +2969,19 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         {/* Quant Score */}
         {mainQuant && (
           <div style={{ padding: "12px 20px 0" }}>
-            <QuantGauge score={mainQuant.score} verdict={mainQuant.verdict} />
+            <QuantGauge
+              score={mainQuant.score}
+              verdict={mainQuant.verdict}
+              timing={mainData ? calculateEntryTiming(activeStock, mainData, mainQuant, regime) : null}
+              onTimingClick={() => setTab("timing")}
+            />
+          </div>
+        )}
+
+        {/* Thai Gold Panel — only when GC=F selected */}
+        {activeStock === "GC=F" && thaiGold && (
+          <div style={{ padding: "12px 20px 0" }}>
+            <ThaiGoldPanel data={thaiGold} />
           </div>
         )}
 

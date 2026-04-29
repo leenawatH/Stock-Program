@@ -4,6 +4,7 @@
     { "source": "/api/finnhub/:path*", "destination": "https://finnhub.io/:path*" },
     { "source": "/api/anthropic/:path*", "destination": "https://api.anthropic.com/:path*" },
     { "source": "/api/fx/:path*", "destination": "https://api.frankfurter.app/:path*" },
-    { "source": "/api/translate/:path*", "destination": "https://translate.googleapis.com/:path*" }
+    { "source": "/api/translate/:path*", "destination": "https://translate.googleapis.com/:path*" },
+    { "source": "/api/hsh/:path*", "destination": "https://apicheckprice.huasengheng.com/:path*" }
   ]
 }
