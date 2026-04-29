@@ -50,6 +50,13 @@ export default defineConfig({
         rewrite: (p) => p.replace(/^\/api\/hsh/, ""),
         headers: { "User-Agent": BROWSER_UA },
       },
+      "/api/bitkub": {
+        target: "https://api.bitkub.com",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (p) => p.replace(/^\/api\/bitkub/, ""),
+        headers: { "User-Agent": BROWSER_UA },
+      },
     },
   },
 });

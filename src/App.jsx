@@ -144,6 +144,40 @@ async function fetchThaiGoldPrice() {
   } catch { return null; }
 }
 
+// Bitkub (กระดานเทรดคริปโตในไทย) — ราคา crypto เป็นบาทไทย real-time
+// proxy → api.bitkub.com/api/market/ticker
+// คืน object key = "THB_BTC", "THB_ETH", "THB_DOGE", ...
+// ticker → bitkub symbol map
+const BITKUB_SYM = {
+  "BTC-USD":  "THB_BTC",
+  "DOGE-USD": "THB_DOGE",
+  "ETH-USD":  "THB_ETH",
+};
+async function fetchBitkubPrices() {
+  try {
+    const res = await fetch("/api/bitkub/api/market/ticker");
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!d || typeof d !== "object") return null;
+    const out = {};
+    for (const [tk, sym] of Object.entries(BITKUB_SYM)) {
+      const r = d[sym];
+      if (!r) continue;
+      out[tk] = {
+        last:          Number(r.last) || null,
+        bid:           Number(r.highestBid) || null,
+        ask:           Number(r.lowestAsk) || null,
+        high24:        Number(r.high24hr) || null,
+        low24:         Number(r.low24hr) || null,
+        percentChange: Number(r.percentChange) || 0,
+        baseVolume:    Number(r.baseVolume) || 0,   // volume in coin
+        quoteVolume:   Number(r.quoteVolume) || 0,  // volume in THB
+      };
+    }
+    return out;
+  } catch { return null; }
+}
+
 // Google Translate (free, no API key) — proxied via /api/translate
 async function translateText(text, target = "th") {
   if (!text || typeof text !== "string") return text;
@@ -1331,7 +1365,7 @@ function APIKeySetup({ onSave }) {
   );
 }
 
-function StockCard({ ticker, data, quant, timing, thaiGold, loading, onSelect, isActive }) {
+function StockCard({ ticker, data, quant, timing, thaiGold, bitkub, loading, onSelect, isActive }) {
   const info = STOCKS[ticker];
   const change = data ? ((data.current - data.previousClose) / data.previousClose) * 100 : 0;
   const isUp = change >= 0;
@@ -1402,6 +1436,16 @@ function StockCard({ ticker, data, quant, timing, thaiGold, loading, onSelect, i
               <div style={{ fontSize: 9, color: "rgba(255,255,255,0.5)", marginTop: 2,
                 fontFamily: "'Space Mono', monospace" }}>
                 {fmtPrice(data.current, ticker)}/oz
+              </div>
+            </>
+          ) : bitkub?.[ticker]?.last ? (
+            <>
+              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 14, fontWeight: 700, color: info.color }}>
+                ฿{bitkub[ticker].last.toLocaleString(undefined, { maximumFractionDigits: bitkub[ticker].last < 100 ? 4 : 0 })}
+              </div>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.5)", marginTop: 2,
+                fontFamily: "'Space Mono', monospace" }}>
+                {fmtPrice(data.current, ticker)}
               </div>
             </>
           ) : (
@@ -1504,6 +1548,104 @@ function ThaiGoldPanel({ data }) {
       <Row label="ทองแท่ง HSH" sub="ฮั่วเซ่งเฮง real-time" row={data.hsh} accent="#ffd700" highlight />
       <Row label="ทองแท่ง REF" sub="อ้างอิงสมาคมค้าทองคำ"  row={data.ref} accent="#fbbf24" />
       <Row label="ทองรูปพรรณ"  sub="JEWEL"                 row={data.jewel} accent="#f59e0b" />
+    </div>
+  );
+}
+
+function BitkubPanel({ ticker, info, data }) {
+  if (!data) return null;
+  const accent = info?.color || "#22c55e";
+  const isUp = data.percentChange >= 0;
+  const chgColor = isUp ? "#4ade80" : "#f87171";
+  const spread = (data.ask != null && data.bid != null) ? data.ask - data.bid : null;
+  const spreadPct = (spread != null && data.last) ? (spread / data.last) * 100 : null;
+  const fmtNum = (n) => n == null ? "—" :
+    n.toLocaleString(undefined, { maximumFractionDigits: n < 1 ? 6 : n < 100 ? 4 : 2 });
+  const fmtVol = (n) => {
+    if (!n) return "—";
+    if (n >= 1e9) return (n/1e9).toFixed(2) + "B";
+    if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
+    return n.toFixed(0);
+  };
+  return (
+    <div style={{
+      padding: "12px 14px",
+      background: `linear-gradient(135deg, ${accent}15, rgba(0,0,0,0.4))`,
+      border: `1px solid ${accent}55`,
+      borderRadius: 18,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontSize: 11, color: accent, letterSpacing: 1, fontWeight: 700 }}>
+          🇹🇭 Bitkub · THB_{ticker.split("-")[0]}
+        </div>
+        <div style={{ fontSize: 9, color: chgColor, fontWeight: 700,
+          fontFamily: "'Space Mono', monospace" }}>
+          {isUp ? "▲" : "▼"} {Math.abs(data.percentChange).toFixed(2)}% 24h
+        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 6 }}>
+        <div style={{ fontSize: 22, fontWeight: 800, color: accent,
+          fontFamily: "'Space Mono', monospace" }}>
+          ฿{fmtNum(data.last)}
+        </div>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>last price</div>
+      </div>
+
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8,
+      }}>
+        <div style={{ padding: "8px 10px", background: "rgba(74,222,128,0.08)",
+          border: "1px solid rgba(74,222,128,0.25)", borderRadius: 10 }}>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.45)" }}>BID (รับซื้อ)</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80",
+            fontFamily: "'Space Mono', monospace", marginTop: 2 }}>
+            ฿{fmtNum(data.bid)}
+          </div>
+        </div>
+        <div style={{ padding: "8px 10px", background: "rgba(248,113,113,0.08)",
+          border: "1px solid rgba(248,113,113,0.25)", borderRadius: 10 }}>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.45)" }}>ASK (ขายออก)</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#f87171",
+            fontFamily: "'Space Mono', monospace", marginTop: 2 }}>
+            ฿{fmtNum(data.ask)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8,
+        fontFamily: "'Space Mono', monospace",
+      }}>
+        <div>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>24h High</div>
+          <div style={{ fontSize: 11, color: "#fff", marginTop: 2 }}>฿{fmtNum(data.high24)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>24h Low</div>
+          <div style={{ fontSize: 11, color: "#fff", marginTop: 2 }}>฿{fmtNum(data.low24)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>Spread</div>
+          <div style={{ fontSize: 11, color: accent, marginTop: 2 }}>
+            {spreadPct != null ? `${spreadPct.toFixed(3)}%` : "—"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{
+        marginTop: 8, padding: "6px 10px",
+        background: "rgba(255,255,255,0.03)", borderRadius: 8,
+        display: "flex", justifyContent: "space-between",
+        fontFamily: "'Space Mono', monospace", fontSize: 10,
+      }}>
+        <span style={{ color: "rgba(255,255,255,0.5)" }}>
+          Vol: <span style={{ color: "#fff" }}>{fmtVol(data.baseVolume)}</span> {ticker.split("-")[0]}
+        </span>
+        <span style={{ color: "rgba(255,255,255,0.5)" }}>
+          ≈ <span style={{ color: "#fff" }}>฿{fmtVol(data.quoteVolume)}</span>
+        </span>
+      </div>
     </div>
   );
 }
@@ -2681,6 +2823,7 @@ export default function StockQuantL3() {
   const [positions, setPositions] = useState({});
   const [view, setView] = useState("quant");
   const [thaiGold, setThaiGold] = useState(null);
+  const [bitkub, setBitkub] = useState(null);
 
   // Load API key + positions on mount
   useEffect(() => {
@@ -2697,6 +2840,15 @@ export default function StockQuantL3() {
     const id = setInterval(() => {
       fetchThaiGoldPrice().then(r => r && setThaiGold(r));
     }, 600000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Fetch Bitkub crypto prices on mount + refresh every 30s
+  useEffect(() => {
+    fetchBitkubPrices().then(r => r && setBitkub(r));
+    const id = setInterval(() => {
+      fetchBitkubPrices().then(r => r && setBitkub(r));
+    }, 30000);
     return () => clearInterval(id);
   }, []);
 
@@ -2960,6 +3112,7 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
                 ? calculateEntryTiming(ticker, allData[ticker], quants[ticker], regime)
                 : null}
               thaiGold={thaiGold}
+              bitkub={bitkub}
               loading={loading[ticker]}
               onSelect={setActiveStock} isActive={activeStock === ticker}
             />
@@ -2982,6 +3135,13 @@ ${quant.divergences.length > 0 ? `🚨 DIVERGENCES:\n${quant.divergences.map(d =
         {activeStock === "GC=F" && thaiGold && (
           <div style={{ padding: "12px 20px 0" }}>
             <ThaiGoldPanel data={thaiGold} />
+          </div>
+        )}
+
+        {/* Bitkub Panel — when crypto selected */}
+        {bitkub?.[activeStock] && (
+          <div style={{ padding: "12px 20px 0" }}>
+            <BitkubPanel ticker={activeStock} info={mainInfo} data={bitkub[activeStock]} />
           </div>
         )}
 
